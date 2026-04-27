@@ -82,13 +82,40 @@ python Main.py
 
 ## 打包发布
 
-使用 PyInstaller 进行目录模式打包：
+使用 PyInstaller 进行目录模式打包。
+
+**Windows：**
 
 ```bash
 pyinstaller molvis.spec
 ```
 
-打包产物位于 `dist/molvis/` 目录下。
+**Linux：**
+
+```bash
+pyinstaller molvis_linux.spec
+```
+
+打包产物均位于 `dist/molvis/` 目录下。
+
+### 运行打包后的程序
+
+**Windows：**
+
+```bash
+dist\molvis\molvis.exe
+```
+
+**Linux：**
+
+```bash
+./dist/molvis/molvis
+```
+
+> **Linux 用户注意**：如果中文显示为方框，请安装中文字体：
+> ```bash
+> sudo apt install -y fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk
+> ```
 
 ## License
 
