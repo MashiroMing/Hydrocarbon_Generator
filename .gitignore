@@ -24,8 +24,6 @@ Thumbs.db
 # Project specific
 *.bak
 temp/
-molvis.spec
-runtime_hook.py
 
 # CodeBuddy
 .codebuddy/
