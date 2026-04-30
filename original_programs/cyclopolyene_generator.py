@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import networkx as nx
 
-# 确保 core_modules 可以被正确导入
+# 确保 original_programs 可以被正确导入
 _current_file = Path(__file__).resolve()
 _project_root = _current_file.parent.parent
 if str(_project_root) not in sys.path:
@@ -56,8 +56,8 @@ class CyclopolyeneGenerator:
         if cycloalkane_generator is not None:
             self.cycloalkane_gen = cycloalkane_generator
         else:
-            from core_modules.cycloalkane_app import CycloalkaneGenerator
-            self.cycloalkane_gen = CycloalkaneGenerator()
+            from original_programs.multcycloalkane import PolycycloalkaneGenerator
+            self.cycloalkane_gen = PolycycloalkaneGenerator()
 
     def generate_all_layers(self, n_carbons: int, max_double_bonds: int = None,
                             verbose: bool = True) -> Dict[int, List[nx.Graph]]:
@@ -229,7 +229,7 @@ class CyclopolyeneGenerator:
 
     def _can_insert_double_bond(self, G: nx.Graph, u: int, v: int) -> bool:
         """
-        检查边(u,v)是否可以插入双键
+        检查边(u,v)是否可以插入双键（兼容环结构中桥头碳等情形）
 
         Args:
             G: 当前图
@@ -252,11 +252,9 @@ class CyclopolyeneGenerator:
             )
             new_double_bonds = existing_double_bonds + 1
 
+            # 累积二烯: 同一碳参与≥2个双键时度数 ≤ 2
             if new_double_bonds >= 2:
                 if deg > 2:
-                    return False
-            else:
-                if deg > 3:
                     return False
 
         return True
@@ -297,7 +295,7 @@ class CyclopolyeneGenerator:
 
     def _validate_molecule(self, G: nx.Graph) -> bool:
         """
-        验证分子结构的化学有效性
+        验证分子结构的化学有效性（兼容环结构中桥头碳等情形）
 
         Returns:
             是否化学有效
@@ -314,19 +312,10 @@ class CyclopolyeneGenerator:
                 if G[node][nb].get('bond_type', 'single') == 'double'
             )
 
+            # 累积二烯: 同一碳参与≥2个双键时度数 ≤ 2
             if double_bond_count >= 2:
                 if deg > 2:
                     return False
-            elif double_bond_count == 1:
-                if deg > 3:
-                    return False
-            else:
-                if deg > 4:
-                    return False
-
-            h_count = 4 - bond_load
-            if h_count < 0:
-                return False
 
         return True
 
@@ -354,7 +343,7 @@ class CyclopolyeneGenerator:
         Returns:
             nx.Graph列表（含bond_type属性）
         """
-        cycloalkane_graphs = self.cycloalkane_gen.generate_isomers(n_carbons)
+        cycloalkane_graphs = self.cycloalkane_gen.generate_isomers(n_carbons, n_rings=1, verbose=False)
 
         graphs = []
         for G in cycloalkane_graphs:

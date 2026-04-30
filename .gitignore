@@ -27,3 +27,7 @@ temp/
 
 # CodeBuddy
 .codebuddy/
+
+# 第三方对比项目（不纳入仓库）
+MAYGEN/
+MolGen/

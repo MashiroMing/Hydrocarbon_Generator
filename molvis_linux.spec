@@ -94,10 +94,9 @@ a = Analysis(
         'original_programs.polyene_generator',
         'diene',
         'diene.core',
-        'core_modules',
-        'core_modules.cycloalkane_app',
-        'core_modules.cycloalkene_generator',
-        'core_modules.cyclopolyene_generator',
+        'original_programs.multcycloalkane',
+        'original_programs.cycloalkene_generator',
+        'original_programs.cyclopolyene_generator',
         # tkinter
         'tkinter',
         'tkinter.filedialog',

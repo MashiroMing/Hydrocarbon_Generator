@@ -89,13 +89,10 @@ def _parallel_compute_coords(args):
             return idx, *_rdkit_coords_single(G)
 
         elif mol_type in ('alkene', 'diene', 'cycloalkene', 'cyclopolyene',
-                          'triene', 'tetraene', 'polyene'):
+                          'triene', 'tetraene', 'polyene', 'multcycloalkane'):
             return idx, *_rdkit_coords_with_bonds(G, double_only=True)
 
-        elif mol_type == 'alkyne':
-            return idx, *_rdkit_coords_with_bonds(G, double_only=False)
-
-        elif mol_type == 'alkenyl':
+        elif mol_type in ('alkyne', 'alkenyl', 'multcyclomultalkane'):
             return idx, *_rdkit_coords_with_bonds(G, double_only=False)
 
         elif mol_type == 'cycloalkane':
@@ -200,49 +197,60 @@ def _rdkit_coords_with_bonds(G, double_only=True):
 
     mol = Chem.AddHs(mol)
 
-    # 检测图是否有环（环状分子需要特殊处理）
+    # 检测是否含环（含环分子使用多种子策略避免高张力构象）
     has_ring = len(nx.cycle_basis(G)) > 0
 
     if has_ring:
-        # 环状分子：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-        AllChem.Compute2DCoords(mol)
-        c_coords, h_coords = _extract_coords(mol)
-
-        # 验证环内键长是否合理（MMFF对小环/累积双键环可能产生畸变）
-        if c_coords:
-            cycles = nx.cycle_basis(G)
-            for cycle in cycles:
-                for ci in range(len(cycle)):
-                    u = cycle[ci]
-                    v = cycle[(ci + 1) % len(cycle)]
-                    if u in c_coords and v in c_coords:
-                        dist = math.sqrt(sum((a - b) ** 2
-                                             for a, b in zip(c_coords[u], c_coords[v])))
-                        # 环内键长超过2.0A说明环已严重畸变
-                        if dist > 2.0:
-                            return _fallback_coords_from_graph(G)
-
-        # 修正累积双键段(C=C=C)的共线问题
-        if double_bonds:
-            c_coords = _fix_cumulated_diene_coords_standalone(G, c_coords)
-
-        return c_coords, h_coords
-
-    # 非环分子：使用3D坐标嵌入 + MMFF力场优化
-    result = AllChem.EmbedMolecule(mol, randomSeed=42)
-    embed_ok = result != -1
-    if not embed_ok:
-        result2 = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
-        embed_ok = result2 != -1
-
-    if not embed_ok:
-        # RDKit 嵌入失败：回退到基于图的2D坐标
-        return _fallback_coords_from_graph(G)
-
-    try:
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
-    except Exception:
-        pass
+        # 含环分子：多种子选择策略，选择最大C-C键长最短的构象
+        best_mol = None
+        best_max_bond = float('inf')
+        for seed in range(50):
+            mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+            params = AllChem.ETKDGv3()
+            params.randomSeed = seed
+            result = AllChem.EmbedMolecule(mol_trial, params)
+            if result == -1:
+                result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                if result2 == -1:
+                    continue
+            try:
+                AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+            except Exception:
+                pass
+            # 计算最大C-C键长
+            conf = mol_trial.GetConformer()
+            max_bond = 0.0
+            for u, v in G.edges():
+                if u < n_carbons and v < n_carbons:
+                    p1 = conf.GetAtomPosition(u)
+                    p2 = conf.GetAtomPosition(v)
+                    dist = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
+                    max_bond = max(max_bond, dist)
+            if max_bond < best_max_bond:
+                best_max_bond = max_bond
+                best_mol = Chem.Mol(mol_trial.ToBinary())
+        if best_mol is not None:
+            mol = best_mol
+        else:
+            # 所有种子都失败，回退到2D坐标
+            AllChem.Compute2DCoords(mol)
+    else:
+        # 非环分子：使用单种子3D嵌入
+        embed_ok = False
+        result = AllChem.EmbedMolecule(mol, randomSeed=42)
+        if result != -1:
+            embed_ok = True
+        else:
+            result2 = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
+            if result2 != -1:
+                embed_ok = True
+        if not embed_ok:
+            AllChem.Compute2DCoords(mol)
+        else:
+            try:
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+            except Exception:
+                pass
 
     c_coords, h_coords = _extract_coords(mol)
 
@@ -451,19 +459,21 @@ class MoleculeApp:
     def _init_generators(self):
         """初始化各分子生成器（委托给 GeneratorManager）"""
         self.gen_mgr = GeneratorManager()
-        # 将生成器属性暴露到 self 上，保持向后兼容
+        # 烷烃专用生成器（独立于统一生成器）
         self.alkane_generator = self.gen_mgr.alkane_generator
         self.alkane_visualizer = self.gen_mgr.alkane_visualizer
-        self.alkyne_generator = self.gen_mgr.alkyne_generator
-        self.alkyne_visualizer = self.gen_mgr.alkyne_visualizer
-        self.diene_generator = self.gen_mgr.diene_generator
-        self.cycloalkane_generator = self.gen_mgr.cycloalkane_generator
-        self.cycloalkane_builder = self.gen_mgr.cycloalkane_builder
-        self.cycloalkene_generator = self.gen_mgr.cycloalkene_generator
-        self.cyclopolyene_generator = self.gen_mgr.cyclopolyene_generator
-        self.alkenyl_generator = self.gen_mgr.alkenyl_generator
-        self.polyene_generator = self.gen_mgr.polyene_generator
+        # 统一生成器（所有非烷烃类型）
+        self.unified_generator = self.gen_mgr.unified_generator
         self.generators = self.gen_mgr.generators
+
+        # 兼容属性：从统一生成器内部获取子模块（用于可视化/坐标计算等）
+        self.multcycloalkane_generator = self.unified_generator.ring_gen
+        self.cyclopolyene_generator = self.unified_generator.cyclopolyene_gen
+        self.diene_generator = self.unified_generator.polyenyne_gen
+
+        # 炔烃可视化器（独立实例，用于坐标计算和可视化）
+        from original_programs.alkyne import AlkyneIsomerVisualizer
+        self.alkyne_visualizer = AlkyneIsomerVisualizer()
 
     def _configure_styles(self):
         """配置界面样式"""
@@ -493,7 +503,7 @@ class MoleculeApp:
 
         ttk.Label(
             title_frame,
-            text="生成并可视化烷烃、烯烃、炔烃、多烯烃、环烷烃、单环多烯烃、烯炔烃的同分异构体",
+            text="生成并可视化烃类的同分异构体",
             style='Info.TLabel'
         ).pack()
 
@@ -803,7 +813,7 @@ class MoleculeApp:
         self.info_text.delete(1.0, tk.END)
 
         # 在后台线程中生成
-        thread = threading.Thread(target=self._generate_in_background, args=(target_types, n_carbon))
+        thread = threading.Thread(target=self._generate_in_background, args=(target_types, n_carbon, type_filter))
         thread.daemon = True
         thread.start()
 
@@ -817,7 +827,7 @@ class MoleculeApp:
         """验证输入（已弃用，由 _parse_molecule_input 替代）"""
         return True
 
-    def _generate_in_background(self, target_types, n_carbon):
+    def _generate_in_background(self, target_types, n_carbon, type_filter='all'):
         """在后台线程中生成异构体（支持多种分子类型）"""
         try:
             cancelled = False
@@ -832,24 +842,21 @@ class MoleculeApp:
 
             n_hydrogen = getattr(self, '_current_n_hydrogen', None)
 
-            total_types = len(target_types)
-            for type_idx, mol_type in enumerate(target_types):
-                if self.cancel_requested or self.window_closed:
-                    cancelled = True
-                    break
-
-                base_progress = int(type_idx / total_types * 80) + 10
-                mol_name_cn = MOL_NAMES_CN.get(mol_type, mol_type)
-                self._update_progress(base_progress, f"生成{mol_name_cn}异构体...")
-
-                isomers = self.gen_mgr.generate(mol_type, n_carbon, n_hydrogen)
-
-                type_counts[mol_type] = len(isomers)
+            if type_filter == 'all':
+                # "全部"模式：使用 generate_all 统一生成，避免跨类型重复
+                self._update_progress(10, "统一生成异构体...")
+                all_isomers = self.gen_mgr.generate_all(n_carbon, n_hydrogen)
+                # 统计各类型数量
+                for mol_type, iso in all_isomers:
+                    type_counts[mol_type] = type_counts.get(mol_type, 0) + 1
+            else:
+                # 单类型模式：只生成指定类型
+                isomers = self.gen_mgr.generate(type_filter, n_carbon, n_hydrogen)
+                type_counts[type_filter] = len(isomers)
                 for iso in isomers:
-                    all_isomers.append((mol_type, iso))
+                    all_isomers.append((type_filter, iso))
 
-                progress = int((type_idx + 1) / total_types * 80) + 10
-                self._update_progress(progress, f"已生成 {mol_name_cn} {len(isomers)} 个异构体")
+            self._update_progress(90, "生成完成")
 
             # 检查是否被取消或窗口已关闭
             if self.cancel_requested or self.window_closed:
@@ -1023,7 +1030,7 @@ class MoleculeApp:
             except:
                 return 0  # 默认返回0
         
-        if mol_type in ('cycloalkane', 'cycloalkene', 'cyclopolyene'):
+        if mol_type in ('cycloalkane', 'cycloalkene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             # 环烷烃/单环烯烃：计算环的大小
             # 优化：对于恰好含一个环的图，环长 = 边数 - 节点数 + 1
             # 更快的方式：直接用 cycle_basis，但先尝试用度数<=2的节点剥离法
@@ -1105,9 +1112,13 @@ class MoleculeApp:
             filter_label = "环大小:"
         elif mol_type == 'cyclopolyene':
             filter_label = "环大小:"
+        elif mol_type == 'multcycloalkane':
+            filter_label = "环大小:"
+        elif mol_type == 'multcyclomultalkane':
+            filter_label = "环大小:"
         elif mol_type == 'mixed':
             # 混合类型：检查是否包含环烷烃
-            has_cyclo = any(isinstance(isomer, tuple) and isomer[0] in ('cycloalkane', 'cycloalkene', 'cyclopolyene') for isomer in isomers)
+            has_cyclo = any(isinstance(isomer, tuple) and isomer[0] in ('cycloalkane', 'cycloalkene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane') for isomer in isomers)
             has_chain = any(isinstance(isomer, tuple) and isomer[0] in ('alkane', 'alkene', 'alkyne', 'diene', 'alkenyl') for isomer in isomers)
             if has_cyclo and has_chain:
                 filter_label = "特征值:"
@@ -1231,7 +1242,7 @@ class MoleculeApp:
             elif mol_type == 'alkene':
                 # 烯烃返回 nx.Graph 对象
                 info = self._get_graph_info_text(isomer_data, idx, mol_type, formulas)
-            elif mol_type in ['diene', 'cycloalkane', 'cycloalkene', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene']:
+            elif mol_type in ['diene', 'cycloalkane', 'cycloalkene', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane']:
                 # 二烯烃、环烷烃和单环烯烃返回 Graph
                 if isinstance(isomer_data, str):
                     info = f"""【异构体 #{idx+1} 详细信息】
@@ -1372,6 +1383,12 @@ class MoleculeApp:
             h_count = 2 * n_atoms - 6
         elif mol_type == 'polyene':
             # 从图中直接计算（每个碳4个价键，减去已用键数）
+            h_count = sum(4 - sum(2 if G[node][nb].get('bond_type')=='double' else 3 if G[node][nb].get('bond_type')=='triple' else 1 for nb in G.neighbors(node)) for node in G.nodes())
+        elif mol_type == 'multcycloalkane':
+            # 多环烷烃：每个碳4个价键，减去C-C键数
+            h_count = sum(4 - G.degree(node) for node in G.nodes())
+        elif mol_type == 'multcyclomultalkane':
+            # 多环多烯炔烃：每个碳4个价键，减去键负载
             h_count = sum(4 - sum(2 if G[node][nb].get('bond_type')=='double' else 3 if G[node][nb].get('bond_type')=='triple' else 1 for nb in G.neighbors(node)) for node in G.nodes())
         else:
             h_count = 2 * n_atoms
@@ -2495,9 +2512,9 @@ class MoleculeApp:
                 # 使用烷烃可视化器
                 self.alkane_visualizer.visualize_isomer(n_carbon, idx, show=True)
             elif isomer_mol_type == 'diene':
-                # 二烯烃：使用 PolyeneIsomerGenerator 的可视化
-                desc = self.diene_generator.describe_isomer(isomer)
-                self.diene_generator.visualize_isomer(isomer, title=desc)
+                # 二烯烃：使用RDKit可视化（含双键标记）
+                mol_name = self._get_mol_display_name(isomer_mol_type, n_carbon)
+                self._visualize_polyene(isomer, f"{mol_name} #{idx+1}")
             elif isomer_mol_type == 'alkene':
                 # 烯烃：使用 AlkeneIsomerVisualizer
                 self.alkene_visualizer.visualize_isomer(isomer, show=True)
@@ -2522,6 +2539,16 @@ class MoleculeApp:
                 desc = self.cyclopolyene_generator.describe_isomer(isomer)
                 formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
                 self._visualize_cyclopolyene(isomer, f"{formula} 单环多烯烃 #{idx+1} ({desc})")
+            elif isomer_mol_type == 'multcycloalkane':
+                # 多环烷烃：使用多环烷烃可视化方法
+                desc = self.multcycloalkane_generator.describe_isomer(isomer)
+                formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
+                self._visualize_multcycloalkane(isomer, f"{formula} 多环烷烃 #{idx+1} ({desc})")
+            elif isomer_mol_type == 'multcyclomultalkane':
+                # 多环多烯炔烃：使用统一生成器的可视化方法
+                formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
+                desc = self.unified_generator.describe_isomer(isomer)
+                self.unified_generator.visualize_isomer(isomer, title=f"{formula} 多环多烯炔烃 #{idx+1} ({desc})")
         except tk.TclError:
             pass  # 窗口已关闭
         except Exception as e:
@@ -2741,7 +2768,7 @@ class MoleculeApp:
 
         # 缩放键长至真实值（包括C-H键长，Compute2DCoords默认C-H距离~1.5Å，GaussView无法识别）
         # GaussView根据原子间距离判断键级，MMFF优化后双键距离偏长(~1.45A)会被误判为单键
-        if mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene'):
+        if mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             c_coords, h_coords = self._scale_multi_bond_distances(G, c_coords, h_coords)
 
         # ========== 生成 Gaussian .gjf 格式 ==========
@@ -2766,7 +2793,7 @@ class MoleculeApp:
             lines.append(f"H     {coord[0]:>12.6f} {coord[1]:>12.6f} {coord[2]:>12.6f}")
 
         # 4. 对于含双键的类型，添加键连接信息（GaussView 依赖此信息识别键级）
-        if mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene'):
+        if mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             lines.append("")
             n_c = G.number_of_nodes()
             # 收集C-C键信息
@@ -2811,7 +2838,7 @@ class MoleculeApp:
         mol_names = MOL_NAMES_EN
 
         # 缩放键长至真实值（包括C-H键长）
-        if G is not None and mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene'):
+        if G is not None and mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             c_coords, h_coords = self._scale_multi_bond_distances(G, c_coords, h_coords)
 
         lines = []
@@ -2864,7 +2891,7 @@ class MoleculeApp:
             abs(c[0]) > 0.001 or abs(c[1]) > 0.001 or abs(c[2]) > 0.001
             for c in c_coords.values()
         ) if c_coords else False
-        if G is not None and has_valid_coords and mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene'):
+        if G is not None and has_valid_coords and mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             lines.append("")
             n_c = G.number_of_nodes()
             bond_lines = []
@@ -3118,12 +3145,26 @@ class MoleculeApp:
                 if c_coords_rdkit is not None:
                     return c_coords_rdkit, h_coords_rdkit
                 else:
-                    # RDKit 嵌入失败，回退到手动计算
-                    main_cycle = nx.cycle_basis(G)[0]
-                    node_to_coord, hydrogen_coords = self.cycloalkane_builder.build_coordinates(G, main_cycle)
-                    c_coords = {i: node_to_coord[i] for i in G.nodes() if i in node_to_coord}
-                    h_coords = [h[0] for h in hydrogen_coords]
-                    return c_coords, h_coords
+                    # RDKit 嵌入失败，尝试 PolycycloalkaneGenerator 的多种子策略
+                    mol = self.multcycloalkane_generator.graph_to_rdkit_mol(G, optimize=True)
+                    if mol is not None and mol.GetNumConformers() > 0:
+                        conf = mol.GetConformer()
+                        c_coords = {}
+                        h_coords = []
+                        for atom in mol.GetAtoms():
+                            pos = conf.GetAtomPosition(atom.GetIdx())
+                            coord = np.array([float(pos.x), float(pos.y), float(pos.z)])
+                            if atom.GetSymbol() == 'C':
+                                c_coords[atom.GetIdx()] = coord
+                            else:
+                                h_coords.append(coord)
+                        return c_coords, h_coords
+                    # 最终回退：2D坐标
+                    c_coords = {}
+                    for node in G.nodes():
+                        angle = 2 * np.pi * node / G.number_of_nodes()
+                        c_coords[node] = np.array([np.cos(angle), np.sin(angle), 0.0])
+                    return c_coords, []
 
             elif mol_type == 'cycloalkene':
                 # 单环烯烃：使用 RDKit 生成高质量3D坐标（含双键信息 + 力场优化）
@@ -3421,6 +3462,213 @@ class MoleculeApp:
 
                 # 修正累积双键段(C=C=C)的共线问题
                 c_coords = self._fix_cumulated_diene_coords(G, c_coords)
+
+                return c_coords, h_coords
+
+            elif mol_type == 'multcycloalkane':
+                # 多环烷烃：使用 RDKit 生成3D坐标（全单键，含力场优化）
+                import math
+                from rdkit import Chem
+                from rdkit.Chem import AllChem, BondType
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+
+                n_carbons = G.number_of_nodes()
+
+                mol = Chem.RWMol()
+                for i in range(n_carbons):
+                    mol.AddAtom(Chem.Atom('C'))
+
+                added_bonds = set()
+                for u, v in G.edges():
+                    bond_key = (min(u, v), max(u, v))
+                    if bond_key in added_bonds:
+                        continue
+                    added_bonds.add(bond_key)
+                    mol.AddBond(u, v, BondType.SINGLE)
+
+                # 设置显式氢
+                for node in sorted(G.nodes()):
+                    h_count = 4 - G.degree(node)
+                    if h_count > 0:
+                        mol.GetAtomWithIdx(node).SetNumExplicitHs(h_count)
+
+                mol = mol.GetMol()
+                try:
+                    Chem.SanitizeMol(mol)
+                except Exception:
+                    return self._fallback_coords_from_graph(G)
+
+                mol = Chem.AddHs(mol)
+
+                # 多环烷烃：多种子选择策略，选择最大C-C键长最短的构象
+                best_mol = None
+                best_max_bond = float('inf')
+                for seed in range(50):
+                    mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                    params = AllChem.ETKDGv3()
+                    params.randomSeed = seed
+                    result = AllChem.EmbedMolecule(mol_trial, params)
+                    if result == -1:
+                        result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                        if result2 == -1:
+                            continue
+                    try:
+                        AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                    except Exception:
+                        pass
+                    # 计算最大C-C键长
+                    conf_t = mol_trial.GetConformer()
+                    max_bond = 0.0
+                    for u, v in G.edges():
+                        if u < n_carbons and v < n_carbons:
+                            p1 = conf_t.GetAtomPosition(u)
+                            p2 = conf_t.GetAtomPosition(v)
+                            dist = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
+                            max_bond = max(max_bond, dist)
+                    if max_bond < best_max_bond:
+                        best_max_bond = max_bond
+                        best_mol = Chem.Mol(mol_trial.ToBinary())
+
+                if best_mol is not None:
+                    mol = best_mol
+                else:
+                    # 所有种子都失败，回退到2D坐标
+                    AllChem.Compute2DCoords(mol)
+
+                # 提取坐标
+                conf = mol.GetConformer()
+                c_coords = {}
+                h_coords = []
+
+                for atom in mol.GetAtoms():
+                    pos = conf.GetAtomPosition(atom.GetIdx())
+                    coord = (float(pos.x), float(pos.y), float(pos.z))
+                    if atom.GetSymbol() == 'C':
+                        c_coords[atom.GetIdx()] = coord
+                    else:
+                        h_coords.append(coord)
+
+                # 坐标为空则回退
+                if not c_coords:
+                    return self._fallback_coords_from_graph(G)
+
+                return c_coords, h_coords
+
+            elif mol_type == 'multcyclomultalkane':
+                # 多环多烯炔烃：使用 RDKit 生成3D坐标（含双键+三键信息 + 力场优化）
+                import math
+                from rdkit import Chem
+                from rdkit.Chem import AllChem, BondType
+                from rdkit import RDLogger
+                RDLogger.DisableLog('rdApp.*')
+
+                n_carbons = G.number_of_nodes()
+
+                # 从图中提取双键和三键边信息
+                double_bond_edges = set()
+                triple_bond_edges = set()
+                for u, v, data in G.edges(data=True):
+                    bt = data.get('bond_type', 'single')
+                    key = (min(u, v), max(u, v))
+                    if bt == 'double':
+                        double_bond_edges.add(key)
+                    elif bt == 'triple':
+                        triple_bond_edges.add(key)
+
+                mol = Chem.RWMol()
+                for i in range(n_carbons):
+                    mol.AddAtom(Chem.Atom('C'))
+
+                added_bonds = set()
+                for u, v in G.edges():
+                    bond_key = (min(u, v), max(u, v))
+                    if bond_key in added_bonds:
+                        continue
+                    added_bonds.add(bond_key)
+                    if bond_key in triple_bond_edges:
+                        mol.AddBond(u, v, BondType.TRIPLE)
+                    elif bond_key in double_bond_edges:
+                        mol.AddBond(u, v, BondType.DOUBLE)
+                    else:
+                        mol.AddBond(u, v, BondType.SINGLE)
+
+                # 设置显式氢（根据键负载计算）
+                for node in sorted(G.nodes()):
+                    bond_load = 0
+                    for nb in G.neighbors(node):
+                        bt = G[node][nb].get('bond_type', 'single')
+                        if bt == 'double':
+                            bond_load += 2
+                        elif bt == 'triple':
+                            bond_load += 3
+                        else:
+                            bond_load += 1
+                    h_count = 4 - bond_load
+                    if h_count > 0:
+                        mol.GetAtomWithIdx(node).SetNumExplicitHs(h_count)
+
+                mol = mol.GetMol()
+                try:
+                    Chem.SanitizeMol(mol)
+                except Exception:
+                    return self._fallback_coords_from_graph(G)
+
+                mol = Chem.AddHs(mol)
+
+                # 多环多烯炔烃：多种子选择策略，选择最大C-C键长最短的构象
+                best_mol = None
+                best_max_bond = float('inf')
+                for seed in range(50):
+                    mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                    params = AllChem.ETKDGv3()
+                    params.randomSeed = seed
+                    result = AllChem.EmbedMolecule(mol_trial, params)
+                    if result == -1:
+                        result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                        if result2 == -1:
+                            continue
+                    try:
+                        AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                    except Exception:
+                        pass
+                    # 计算最大C-C键长
+                    conf_t = mol_trial.GetConformer()
+                    max_bond = 0.0
+                    for u, v in G.edges():
+                        if u < n_carbons and v < n_carbons:
+                            p1 = conf_t.GetAtomPosition(u)
+                            p2 = conf_t.GetAtomPosition(v)
+                            dist = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
+                            max_bond = max(max_bond, dist)
+                    if max_bond < best_max_bond:
+                        best_max_bond = max_bond
+                        best_mol = Chem.Mol(mol_trial.ToBinary())
+
+                if best_mol is not None:
+                    mol = best_mol
+                else:
+                    # 所有种子都失败，回退到2D坐标
+                    AllChem.Compute2DCoords(mol)
+
+                # 提取坐标
+                conf = mol.GetConformer()
+                c_coords = {}
+                h_coords = []
+                for atom in mol.GetAtoms():
+                    pos = conf.GetAtomPosition(atom.GetIdx())
+                    coord = (float(pos.x), float(pos.y), float(pos.z))
+                    if atom.GetSymbol() == 'C':
+                        c_coords[atom.GetIdx()] = coord
+                    else:
+                        h_coords.append(coord)
+
+                # 修正累积双键段(C=C=C)的共线问题
+                c_coords = self._fix_cumulated_diene_coords(G, c_coords)
+
+                # 坐标为空则回退
+                if not c_coords:
+                    return self._fallback_coords_from_graph(G)
 
                 return c_coords, h_coords
 
@@ -4372,14 +4620,31 @@ class MoleculeApp:
             c_coords, h_coords, h_to_c = self._build_cycloalkane_rdkit(G)
 
             if c_coords is None:
-                # RDKit 失败，回退到 CycloalkaneBuilder
-                main_cycle = nx.cycle_basis(G)[0]
-                node_to_coord, hydrogen_coords = self.cycloalkane_builder.build_coordinates(G, main_cycle)
-                c_coords = {i: node_to_coord[i] for i in G.nodes() if i in node_to_coord}
-                h_coords = [h[0] for h in hydrogen_coords]
-                h_to_c = {}
-                for idx, (h_coord, carbon) in enumerate(hydrogen_coords):
-                    h_to_c[idx] = carbon
+                # RDKit 失败，尝试 PolycycloalkaneGenerator 的多种子策略
+                mol = self.multcycloalkane_generator.graph_to_rdkit_mol(G, optimize=True)
+                if mol is not None and mol.GetNumConformers() > 0:
+                    conf = mol.GetConformer()
+                    c_coords = {}
+                    h_coords = []
+                    h_to_c = {}
+                    for atom in mol.GetAtoms():
+                        pos = conf.GetAtomPosition(atom.GetIdx())
+                        coord = [float(pos.x), float(pos.y), float(pos.z)]
+                        if atom.GetSymbol() == 'C':
+                            c_coords[atom.GetIdx()] = coord
+                        else:
+                            h_to_c[len(h_coords)] = next((a.GetIdx() for a in atom.GetNeighbors() if a.GetSymbol() == 'C'), 0)
+                            h_coords.append(coord)
+                else:
+                    # 最终回退：2D坐标
+                    import math
+                    c_coords = {}
+                    n_nodes = G.number_of_nodes()
+                    for node in G.nodes():
+                        angle = 2 * math.pi * node / n_nodes
+                        c_coords[node] = [math.cos(angle), math.sin(angle), 0.0]
+                    h_coords = []
+                    h_to_c = {}
 
             ring_set = set(nx.cycle_basis(G)[0])
 
@@ -4448,6 +4713,207 @@ class MoleculeApp:
 
         except Exception as e:
             messagebox.showerror("可视化错误", f"环烷烃可视化失败: {str(e)}")
+
+    def _visualize_multcycloalkane(self, G, title):
+        """可视化多环烷烃异构体（优先使用 RDKit 构建高质量3D坐标）"""
+        try:
+            import math
+            import networkx as nx
+            from rdkit import Chem
+            from rdkit.Chem import AllChem, BondType
+            from rdkit import RDLogger
+            RDLogger.DisableLog('rdApp.*')
+
+            n_carbons = G.number_of_nodes()
+
+            # 构建 RDKit 分子
+            mol = Chem.RWMol()
+            for i in range(n_carbons):
+                mol.AddAtom(Chem.Atom('C'))
+
+            added_bonds = set()
+            for u, v in G.edges():
+                bond_key = (min(u, v), max(u, v))
+                if bond_key in added_bonds:
+                    continue
+                added_bonds.add(bond_key)
+                mol.AddBond(u, v, BondType.SINGLE)
+
+            for node in sorted(G.nodes()):
+                h_count = 4 - G.degree(node)
+                if h_count > 0:
+                    mol.GetAtomWithIdx(node).SetNumExplicitHs(h_count)
+
+            mol = mol.GetMol()
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                pass
+
+            mol = Chem.AddHs(mol)
+
+            # 多环烷烃：多种子选择策略，选择最大C-C键长最短的构象
+            best_mol = None
+            best_max_bond = float('inf')
+            for seed in range(50):
+                mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                params = AllChem.ETKDGv3()
+                params.randomSeed = seed
+                result = AllChem.EmbedMolecule(mol_trial, params)
+                if result == -1:
+                    result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                    if result2 == -1:
+                        continue
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                except Exception:
+                    pass
+                # 计算最大C-C键长
+                conf_t = mol_trial.GetConformer()
+                max_bond = 0.0
+                for u, v in G.edges():
+                    if u < n_carbons and v < n_carbons:
+                        p1 = conf_t.GetAtomPosition(u)
+                        p2 = conf_t.GetAtomPosition(v)
+                        dist = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
+                        max_bond = max(max_bond, dist)
+                if max_bond < best_max_bond:
+                    best_max_bond = max_bond
+                    best_mol = Chem.Mol(mol_trial.ToBinary())
+
+            if best_mol is not None:
+                mol = best_mol
+            else:
+                # 所有种子都失败，回退到2D坐标
+                AllChem.Compute2DCoords(mol)
+
+            # 提取坐标
+            conf = mol.GetConformer()
+            c_coords = {}
+            h_coords = []
+            for atom in mol.GetAtoms():
+                pos = conf.GetAtomPosition(atom.GetIdx())
+                coord = (float(pos.x), float(pos.y), float(pos.z))
+                if atom.GetSymbol() == 'C':
+                    c_coords[atom.GetIdx()] = coord
+                else:
+                    h_coords.append(coord)
+
+            # 如果RDKit坐标失败，回退到基于图的方法
+            if not c_coords:
+                c_coords, h_coords = self._fallback_coords_from_graph(G)
+
+            # 获取环信息
+            cycles = nx.cycle_basis(G)
+
+            # 为不同环分配不同颜色
+            ring_colors = ['#CC0000', '#0066CC', '#009933', '#CC6600', '#6600CC', '#009999']
+            node_ring_color = {}
+            ring_edges = set()
+            for ci, cycle in enumerate(cycles):
+                color = ring_colors[ci % len(ring_colors)]
+                cycle_set = set(cycle)
+                for node in cycle:
+                    if node not in node_ring_color:
+                        node_ring_color[node] = color
+                    # 标记环内边
+                    for j in range(len(cycle)):
+                        u = cycle[j]
+                        v = cycle[(j + 1) % len(cycle)]
+                        ring_edges.add(tuple(sorted([u, v])))
+
+            # 创建图形
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.set_title(title, fontsize=14, fontweight='bold')
+
+            # 绘制 C-C 键
+            drawn_bonds = set()
+            for node in G.nodes():
+                for neighbor in G.neighbors(node):
+                    bond_key = tuple(sorted([node, neighbor]))
+                    if bond_key not in drawn_bonds:
+                        if node in c_coords and neighbor in c_coords:
+                            if bond_key in ring_edges:
+                                ax.plot(
+                                    [c_coords[node][0], c_coords[neighbor][0]],
+                                    [c_coords[node][1], c_coords[neighbor][1]],
+                                    [c_coords[node][2], c_coords[neighbor][2]],
+                                    color='#CC0000', linewidth=2.5
+                                )
+                            else:
+                                ax.plot(
+                                    [c_coords[node][0], c_coords[neighbor][0]],
+                                    [c_coords[node][1], c_coords[neighbor][1]],
+                                    [c_coords[node][2], c_coords[neighbor][2]],
+                                    color='black', linewidth=2
+                                )
+                        drawn_bonds.add(bond_key)
+
+            # 绘制碳原子（不同环用不同颜色）
+            for n in sorted(c_coords.keys()):
+                if n in node_ring_color:
+                    color = node_ring_color[n]
+                else:
+                    color = '#333333'
+                ax.scatter([c_coords[n][0]], [c_coords[n][1]], [c_coords[n][2]],
+                           c=color, s=150, zorder=5)
+
+            # 绘制氢原子和碳氢键
+            if h_coords:
+                h_to_c = {}
+                h_idx = 0
+                for bond in mol.GetBonds():
+                    a1 = bond.GetBeginAtom()
+                    a2 = bond.GetEndAtom()
+                    if a1.GetSymbol() == 'C' and a2.GetSymbol() == 'H':
+                        h_to_c[h_idx] = a1.GetIdx()
+                        h_idx += 1
+                    elif a1.GetSymbol() == 'H' and a2.GetSymbol() == 'C':
+                        h_to_c[h_idx] = a2.GetIdx()
+                        h_idx += 1
+
+                hx = [h[0] for h in h_coords]
+                hy = [h[1] for h in h_coords]
+                hz = [h[2] for h in h_coords]
+                ax.scatter(hx, hy, hz, c='white', edgecolors='gray', s=80, zorder=5)
+
+                for i, h_coord in enumerate(h_coords):
+                    if i in h_to_c and h_to_c[i] in c_coords:
+                        c_coord = c_coords[h_to_c[i]]
+                        ax.plot(
+                            [c_coord[0], h_coord[0]],
+                            [c_coord[1], h_coord[1]],
+                            [c_coord[2], h_coord[2]],
+                            color='gray', linewidth=1, alpha=0.7
+                        )
+
+            # 标记环原子编号
+            for ci, cycle in enumerate(cycles):
+                for i, node in enumerate(cycle):
+                    if node in c_coords:
+                        coord = c_coords[node]
+                        ax.text(coord[0], coord[1], coord[2],
+                                f'{i+1}', fontsize=9, color='blue')
+
+            # 图例
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='#CC0000', linewidth=2.5, label='环内 C-C'),
+                Line2D([0], [0], color='black', linewidth=2, label='环外 C-C'),
+                Line2D([0], [0], color='gray', linewidth=1, label='C-H'),
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', fontsize=9)
+
+            ax.set_xlabel("X (Å)")
+            ax.set_ylabel("Y (Å)")
+            ax.set_zlabel("Z (Å)")
+            ax.view_init(elev=20, azim=45)
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            messagebox.showerror("可视化错误", f"多环烷烃可视化失败: {str(e)}")
 
     def _visualize_alkynes_batch(self, graphs, title):
         """批量可视化炔烃异构体"""
@@ -4525,13 +4991,30 @@ class MoleculeApp:
             try:
                 c_coords, h_coords, h_to_c = self._build_cycloalkane_rdkit(G)
                 if c_coords is None:
-                    main_cycle = nx.cycle_basis(G)[0]
-                    node_to_coord, hydrogen_coords = self.cycloalkane_builder.build_coordinates(G, main_cycle)
-                    c_coords = {i2: node_to_coord[i2] for i2 in G.nodes() if i2 in node_to_coord}
-                    h_coords = [h[0] for h in hydrogen_coords]
-                    h_to_c = {}
-                    for idx, (h_coord, carbon) in enumerate(hydrogen_coords):
-                        h_to_c[idx] = carbon
+                    # RDKit 失败，尝试 PolycycloalkaneGenerator 的多种子策略
+                    mol = self.multcycloalkane_generator.graph_to_rdkit_mol(G, optimize=True)
+                    if mol is not None and mol.GetNumConformers() > 0:
+                        conf = mol.GetConformer()
+                        c_coords = {}
+                        h_coords = []
+                        h_to_c = {}
+                        for atom in mol.GetAtoms():
+                            pos = conf.GetAtomPosition(atom.GetIdx())
+                            coord = [float(pos.x), float(pos.y), float(pos.z)]
+                            if atom.GetSymbol() == 'C':
+                                c_coords[atom.GetIdx()] = coord
+                            else:
+                                h_to_c[len(h_coords)] = next((a.GetIdx() for a in atom.GetNeighbors() if a.GetSymbol() == 'C'), 0)
+                                h_coords.append(coord)
+                    else:
+                        import math
+                        c_coords = {}
+                        n_nodes = G.number_of_nodes()
+                        for node in G.nodes():
+                            angle = 2 * math.pi * node / n_nodes
+                            c_coords[node] = [math.cos(angle), math.sin(angle), 0.0]
+                        h_coords = []
+                        h_to_c = {}
 
                 ring_set = set(nx.cycle_basis(G)[0])
 

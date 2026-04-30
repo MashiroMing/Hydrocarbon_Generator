@@ -1,8 +1,8 @@
 """
 分子式解析与异构体生成分发工具
 
-职责：解析分子式 → 识别分子类型 → 分发到对应生成器
-        键线式（skeletal formula）渲染
+职责：解析分子式 → 按 (环数, 双键数, 三键数) 分类 → 统一由 multcyclomultalkane 生成
+      键线式（skeletal formula）渲染
 """
 
 import re
@@ -10,14 +10,9 @@ import io
 import tempfile
 import os
 
+from original_programs.multcyclomultalkane import RobustPolycyclicPolyeneGenerator, _enumerate_rdt_combinations
 from original_programs.alkane_isomer_visualizer import AlkaneIsomerGenerator, AlkaneIsomerVisualizer
 from original_programs.alkene_visualizer import AlkeneIsomerVisualizer as AlkeneViz
-from original_programs.alkyne import AlkyneIsomerGenerator, AlkyneIsomerVisualizer
-from core_modules.cycloalkane_app import CycloalkaneGenerator, CycloalkaneBuilder
-from core_modules.cycloalkene_generator import CycloalkeneGenerator
-from core_modules.cyclopolyene_generator import CyclopolyeneGenerator
-from original_programs.alkenyl_generator import AlkenylIsomerGenerator
-from original_programs.polyene_generator import PolyeneIsomerGenerator
 
 # 中文名 / 筛选用中文名 / 英文名
 MOL_NAMES_CN = {
@@ -32,6 +27,8 @@ MOL_NAMES_CN = {
     'tetraene': '四烯烃',
     'polyene': '多烯烃',
     'cyclopolyene': '单环多烯烃',
+    'multcycloalkane': '多环烷烃',
+    'multcyclomultalkane': '多环多烯炔烃',
 }
 
 MOL_NAMES_FILTER = {
@@ -46,6 +43,8 @@ MOL_NAMES_FILTER = {
     'tetraene': '四烯烃',
     'polyene': '多烯烃',
     'cyclopolyene': '单环多烯烃',
+    'multcycloalkane': '多环烷烃',
+    'multcyclomultalkane': '多环多烯炔烃',
 }
 
 MOL_NAMES_EN = {
@@ -60,6 +59,8 @@ MOL_NAMES_EN = {
     'tetraene': 'Tetraene',
     'polyene': 'Polyene',
     'cyclopolyene': 'Cyclopolyene',
+    'multcycloalkane': 'Polycycloalkane',
+    'multcyclomultalkane': 'Polycyclic Polyene',
 }
 
 # 不支持的分子式错误提示
@@ -68,15 +69,45 @@ _UNSUPPORTED_MSG = (
     "支持的类型:\n"
     "• 烷烃 CnH2n+2\n"
     "• 单烯烃/单环烷烃 CnH2n (n>=2)\n"
-    "• 单炔烃/二烯烃/单环烯烃 CnH2n-2 (n>=2)\n"
-    "• 烯炔烃/三烯烃/单环二烯烃 CnH2n-4 (n>=4)\n"
-    "• 四烯烃/单环三烯烃 CnH2n-6 (n>=5)\n"
-    "• k-烯烃/单环多烯烃 CnH2n-2k (k>=5)"
+    "• 单炔烃/二烯烃/单环烯烃/双环烷烃 CnH2n-2 (n>=2)\n"
+    "• 烯炔烃/三烯烃/单环二烯烃/三环烷烃 CnH2n-4 (n>=4)\n"
+    "• 四烯烃/单环三烯烃/四环烷烃 CnH2n-6 (n>=5)\n"
+    "• k-烯烃/单环多烯烃/k环烷烃 CnH2n-2k (k>=5)"
 )
 
 
+def _rdt_to_mol_type(n_r: int, n_d: int, n_t: int) -> str:
+    """将 (环数, 双键数, 三键数) 映射为传统分子类型标签"""
+    if n_r == 0 and n_t == 0 and n_d == 1:
+        return 'alkene'
+    if n_r == 0 and n_t == 1 and n_d == 0:
+        return 'alkyne'
+    if n_r == 0 and n_t == 0 and n_d >= 2:
+        # 多烯烃：按双键数细分
+        _diene_names = {2: 'diene', 3: 'triene', 4: 'tetraene'}
+        return _diene_names.get(n_d, 'polyene')
+    if n_r == 0 and n_t >= 1 and n_d >= 1:
+        return 'alkenyl'
+    if n_r == 0 and n_t >= 2:
+        return 'alkenyl'
+    if n_r == 1 and n_t == 0 and n_d == 1:
+        return 'cycloalkene'
+    if n_r == 1 and n_t == 0 and n_d >= 2:
+        return 'cyclopolyene'
+    if n_r == 1 and n_t == 0 and n_d == 0:
+        return 'cycloalkane'
+    if n_r >= 2 and n_t == 0 and n_d == 0:
+        return 'multcycloalkane'
+    # 其余：含环 + 含重键的复杂情况
+    return 'multcyclomultalkane'
+
+
 def parse_molecule_input(formula_str):
-    """解析分子式，返回分子类型列表、碳氢原子数及错误信息"""
+    """解析分子式，返回分类标签列表、碳氢原子数及错误信息
+
+    返回值: (mol_types, n, m, error)
+        mol_types: 按 (r,d,t) 分类后的分子类型列表（去重排序）
+    """
     formula_str = formula_str.strip()
     if not formula_str:
         return None, None, None, "请输入分子式"
@@ -96,49 +127,50 @@ def parse_molecule_input(formula_str):
 
     mol_types = []
 
-    # CnH2n+2: 烷烃
+    # CnH2n+2: 烷烃（无环、无双键三键）
     if m == 2 * n + 2:
         if n >= 1:
             mol_types.append('alkane')
 
-    # CnH2n: 单烯烃 或 单环烷烃
-    elif m == 2 * n:
-        if n >= 3:
-            mol_types.extend(['alkene', 'cycloalkane'])
-        elif n >= 2:
-            mol_types.append('alkene')
-
-    # CnH2n-2: 单炔烃 或 二烯烃 或 单环烯烃
-    elif m == 2 * n - 2:
-        if n >= 3:
-            mol_types.extend(['alkyne', 'diene', 'cycloalkene'])
-        elif n >= 2:
-            mol_types.append('alkyne')
-
-    # CnH2n-4: 烯炔烃 或 三烯烃 或 单环二烯烃
-    elif m == 2 * n - 4:
-        if n >= 4:
-            mol_types.append('alkenyl')
-        if n >= 4:
-            mol_types.append('triene')
-        if n >= 4:
-            mol_types.append('cyclopolyene')
-
-    # CnH2n-6: 四烯烃 或 单环三烯烃
-    elif m == 2 * n - 6:
-        if n >= 5:
-            mol_types.append('tetraene')
-        if n >= 5:
-            mol_types.append('cyclopolyene')
-
-    # CnH(2n+2-2k) (k>=5): 更高阶多烯烃 或 单环多烯烃
-    elif m < 2 * n - 6 and m >= 0 and (2 * n - m) % 2 == 0:
+    # CnH2n+2-2k (k>=1): 不饱和度 k = (2n+2-m)/2
+    elif m <= 2 * n and m >= 0 and (2 * n + 2 - m) % 2 == 0:
         k = (2 * n + 2 - m) // 2
-        if n >= k + 1 and k >= 1:
-            mol_types.append('polyene')
-        cyclo_k = (2 * n - m) // 2
-        if n >= 3 and cyclo_k >= 2:
-            mol_types.append('cyclopolyene')
+        if k < 1:
+            return None, n, m, _UNSUPPORTED_MSG.format(n=n, m=m)
+        if n < 2:
+            return None, n, m, _UNSUPPORTED_MSG.format(n=n, m=m)
+
+        # 枚举所有 (r, d, t) 组合，收集对应的分子类型
+        combos = _enumerate_rdt_combinations(k)
+        type_set = set()
+        for n_r, n_d, n_t in combos:
+            # 检查该组合是否可能产生异构体（基本可行性）
+            # 无环至少需要 n_d + 2*n_t + 1 <= n（确保有足够碳原子）
+            if n_r == 0:
+                if n_d == 0 and n_t == 0:
+                    continue  # 纯烷烃，已被 CnH2n+2 覆盖
+                min_carbons = n_d + 2 * n_t + 1
+                if n < min_carbons:
+                    continue
+            elif n_r == 1 and n_d == 0 and n_t == 0:
+                if n < 3:
+                    continue
+            elif n_r >= 2 and n_d == 0 and n_t == 0:
+                if n < n_r + 2:
+                    continue
+            mol_type = _rdt_to_mol_type(n_r, n_d, n_t)
+            type_set.add(mol_type)
+
+        # 按固定顺序排列
+        _TYPE_ORDER = [
+            'alkene', 'alkyne', 'diene', 'alkenyl',
+            'triene', 'tetraene', 'polyene',
+            'cycloalkane', 'cycloalkene', 'cyclopolyene',
+            'multcycloalkane', 'multcyclomultalkane',
+        ]
+        for t in _TYPE_ORDER:
+            if t in type_set:
+                mol_types.append(t)
 
     else:
         return None, n, m, _UNSUPPORTED_MSG.format(n=n, m=m)
@@ -164,88 +196,91 @@ def compute_formula(mol_type, n_carbon, n_hydrogen=None):
     }
     if mol_type in formula_map:
         return formula_map[mol_type](n_carbon, n_hydrogen)
-    # polyene / cyclopolyene 需要实际氢数
+    # polyene / cyclopolyene / multcycloalkane / multcyclomultalkane 需要实际氢数
     if n_hydrogen is not None:
         return f"C{n_carbon}H{n_hydrogen}"
     return f"C{n_carbon}H?"
 
 
 class GeneratorManager:
-    """统一管理异构体生成器初始化与分发"""
+    """统一管理异构体生成器：所有非烷烃类型均由 multcyclomultalkane 统一生成"""
 
     def __init__(self):
         self._init_generators()
 
     def _init_generators(self):
         """初始化各分子生成器"""
+        # 烷烃：独立生成器（不经过 multcyclomultalkane）
         self.alkane_generator = AlkaneIsomerGenerator(use_parallel=True)
         self.alkane_visualizer = AlkaneIsomerVisualizer(self.alkane_generator)
         self.alkene_visualizer = AlkeneViz(generator=None)
-        self.alkyne_generator = AlkyneIsomerGenerator()
-        self.alkyne_visualizer = AlkyneIsomerVisualizer(generator=self.alkyne_generator)
-        self.diene_generator = PolyeneIsomerGenerator()
-        self.cycloalkane_generator = CycloalkaneGenerator()
-        self.cycloalkane_builder = CycloalkaneBuilder()
-        self.cycloalkene_generator = CycloalkeneGenerator()
-        self.cyclopolyene_generator = CyclopolyeneGenerator()
-        self.alkenyl_generator = AlkenylIsomerGenerator()
-        self.polyene_generator = PolyeneIsomerGenerator()
+
+        # 统一生成器：所有含不饱和度的烃类
+        self.unified_generator = RobustPolycyclicPolyeneGenerator()
 
         self.generators = {
             'alkane':      self.alkane_generator,
-            'alkene':      self.alkene_visualizer,
-            'alkyne':      self.alkyne_generator,
-            'diene':       self.diene_generator,
-            'cycloalkane': self.cycloalkane_generator,
-            'cycloalkene': self.cycloalkene_generator,
-            'cyclopolyene': self.cyclopolyene_generator,
-            'alkenyl':     self.alkenyl_generator,
-            'triene':      self.polyene_generator,
-            'tetraene':    self.polyene_generator,
-            'polyene':     self.polyene_generator,
+            'unified':     self.unified_generator,
         }
 
     def generate(self, mol_type, n_carbon, n_hydrogen=None):
-        """根据分子类型分发到对应生成器，返回异构体列表"""
-        generator = self.generators[mol_type]
+        """根据分子类型分发到对应生成器，返回异构体列表
 
+        对于非烷烃类型，统一使用 multcyclomultalkane.generate()，
+        按 (r,d,t) 组合枚举，并自动分类打标签。
+        """
         if mol_type == 'alkane':
-            return generator.generate_isomers(n_carbon)
+            return self.alkane_generator.generate_isomers(n_carbon)
 
-        elif mol_type == 'alkene':
-            return generator.generate_isomers_optimized(n_carbon, show_progress=False)
-
-        elif mol_type == 'alkyne':
-            return generator.generate_isomers(n_carbon)
-
-        elif mol_type == 'diene':
-            return generator.generate_diene(n_carbon)
-
-        elif mol_type == 'cycloalkane':
-            return generator.generate_isomers(n_carbon)
-
-        elif mol_type == 'cycloalkene':
-            return generator.generate_isomers(n_carbon)
-
-        elif mol_type == 'alkenyl':
-            return generator.generate_isomers(n_carbon)
-
-        elif mol_type in ('triene', 'tetraene', 'polyene'):
-            k_map = {'triene': 3, 'tetraene': 4}
-            k = k_map.get(mol_type)
-            if k is None and n_hydrogen is not None:
-                k = (2 * n_carbon + 2 - n_hydrogen) // 2
-            if k and k >= 1:
-                return generator.generate_k_ene(n_carbon, k)
+        # 计算不饱和度
+        k = 2
+        if n_hydrogen is not None:
+            k = (2 * n_carbon + 2 - n_hydrogen) // 2
+        if k < 1 or n_carbon < 2:
             return []
 
-        elif mol_type == 'cyclopolyene':
-            cyclo_k = 2  # 默认双键数
-            if n_hydrogen is not None:
-                cyclo_k = (2 * n_carbon - n_hydrogen) // 2
-            if cyclo_k >= 2:
-                return self.cyclopolyene_generator.generate_k_cycloene(n_carbon, cyclo_k)
-        return []
+        combos = _enumerate_rdt_combinations(k)
+
+        # 按 mol_type 筛选对应的 (r,d,t) 组合
+        result = []
+        for n_r, n_d, n_t in combos:
+            combo_type = _rdt_to_mol_type(n_r, n_d, n_t)
+            if combo_type != mol_type:
+                continue
+            isomers = self.unified_generator.generate(n_carbon, n_r, n_d, n_t)
+            result.extend(isomers)
+        return result
+
+    def generate_all(self, n_carbon, n_hydrogen):
+        """生成所有类型的异构体，返回 [(mol_type, isomer_graph), ...]
+
+        使用统一的 WL 哈希去重，避免跨类型重复。
+        烷烃单独处理（不会与其他类型重复）。
+        """
+        all_isomers = []
+
+        # 1. 烷烃（CnH2n+2）
+        if n_hydrogen == 2 * n_carbon + 2 and n_carbon >= 1:
+            alkane_isomers = self.alkane_generator.generate_isomers(n_carbon)
+            for iso in alkane_isomers:
+                all_isomers.append(('alkane', iso))
+
+        # 2. 非烷烃：统一生成并分类
+        k = (2 * n_carbon + 2 - n_hydrogen) // 2
+        if k < 1 or n_carbon < 2:
+            return all_isomers
+
+        combos = _enumerate_rdt_combinations(k)
+        for n_r, n_d, n_t in combos:
+            # 跳过纯烷烃组合
+            if n_r == 0 and n_d == 0 and n_t == 0:
+                continue
+            isomers = self.unified_generator.generate(n_carbon, n_r, n_d, n_t)
+            combo_type = _rdt_to_mol_type(n_r, n_d, n_t)
+            for iso in isomers:
+                all_isomers.append((combo_type, iso))
+
+        return all_isomers
 
 
 # ============================================================
@@ -369,7 +404,7 @@ def canon_str_to_graph(canon_str, mol_type, gen_mgr=None):
 def render_skeletal_formula(isomer_data, mol_type, gen_mgr=None, img_size=(400, 300)):
     """渲染分子的键线式（2D skeletal formula）为 PNG 图片字节
 
-    使用 RDKit MolDraw2DSVG 生成标准化学键线式（专业渲染质量），
+    使用 RDKit MolDraw2DSVG 生成标准化学键式（专业渲染质量），
     再通过 cairosvg 转换为 PNG。回退到 matplotlib 手动绘制。
 
     按键线式惯例：碳骨架以折线表示，双键/三键以平行线标注，

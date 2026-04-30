@@ -25,9 +25,9 @@
   C6=12, C7=34, C8=95 (四种算法交叉验证通过)
 
 【使用方法】
-  python -m core_modules.alkenyl_generator
+  python -m original_programs.alkenyl_generator
   或
-  python core_modules/alkenyl_generator.py
+  python original_programs/alkenyl_generator.py
 
 ================================================================================
 """

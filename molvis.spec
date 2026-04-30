@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 目录模式打包
+# Windows 平台目录模式打包
+# 使用方法: pyinstaller molvis.spec
 
 import os
 import sys
@@ -11,9 +12,14 @@ a = Analysis(
     ['Main.py'],
     pathex=[root_dir],
     binaries=[],
-    datas=[],
+    datas=[
+        # 项目自身模块（目录模式确保源码被完整收集）
+        ('original_programs', 'original_programs'),
+        ('utils.py', '.'),
+    ],
     hiddenimports=[
-        # 第三方核心库
+        # ---- 第三方核心库 ----
+        # RDKit
         'rdkit',
         'rdkit.Chem',
         'rdkit.Chem.AllChem',
@@ -22,6 +28,10 @@ a = Analysis(
         'rdkit.Geometry',
         'rdkit.Chem.Draw',
         'rdkit.Chem.rdChemReactions',
+        'rdkit.Chem.Draw.rdMolDraw2D',
+        'rdkit.DataStructs',
+        'rdkit.Chem.rdmolfiles',
+        # NumPy
         'numpy',
         'numpy._core',
         'numpy._core._exceptions',
@@ -73,18 +83,31 @@ a = Analysis(
         'numpy.rec',
         'numpy.strings',
         'numpy.typing',
+        # NetworkX
         'networkx',
+        # Matplotlib
         'matplotlib',
         'matplotlib.pyplot',
         'matplotlib.backends',
+        'matplotlib.backends.backend_qt5agg',
         'matplotlib.backends.backend_tkagg',
         'matplotlib.backend_bases',
         'matplotlib.gridspec',
         'matplotlib.cm',
         'mpl_toolkits',
         'mpl_toolkits.mplot3d',
+        # PyQt5
+        'PyQt5',
+        'PyQt5.QtCore',
+        'PyQt5.QtGui',
+        'PyQt5.QtWidgets',
+        'PyQt5.sip',
+        # PIL / CairoSVG
         'PIL',
-        # 项目模块
+        'PIL.Image',
+        'PIL.ImageTk',
+        'cairosvg',
+        # ---- 项目模块 ----
         'original_programs',
         'original_programs.alkane_isomer_visualizer',
         'original_programs.alkene_visualizer',
@@ -92,17 +115,13 @@ a = Analysis(
         'original_programs.alkyne',
         'original_programs.alkenyl_generator',
         'original_programs.polyene_generator',
-        'diene',
-        'diene.core',
-        'core_modules',
-        'core_modules.cycloalkane_app',
-        'core_modules.cycloalkene_generator',
-        'core_modules.cyclopolyene_generator',
-        # tkinter
-        'tkinter',
-        'tkinter.filedialog',
-        'tkinter.scrolledtext',
-        # 标准库
+        'original_programs.multcycloalkane',
+        'original_programs.multcyclomultalkane',
+        'original_programs.cycloalkene_generator',
+        'original_programs.cyclopolyene_generator',
+        'original_programs.polyalkenyne',
+        'utils',
+        # ---- 标准库 ----
         'multiprocessing',
         'concurrent.futures',
         'itertools',
@@ -114,13 +133,16 @@ a = Analysis(
         'collections.defaultdict',
         'typing',
         'datetime',
+        'pickle',
     ],
     hookspath=[],
     runtime_hooks=[os.path.join(root_dir, 'runtime_hook.py')],
     excludes=[
         'test', 'pytest', 'IPython', 'notebook', 'jupyter', 'sphinx', 'docutils',
-        'PyQt5', 'PySide6', 'PyQt6', 'PySide2',
+        'PySide6', 'PyQt6', 'PySide2',
         'qtpy', 'zmq', 'sqlalchemy', 'tables', 'lxml',
+        'tkinter', 'tkinter.filedialog', 'tkinter.scrolledtext',
+        'MAYGEN', 'MolGen',
     ],
 )
 

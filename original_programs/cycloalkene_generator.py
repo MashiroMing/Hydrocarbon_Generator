@@ -13,7 +13,7 @@ from collections import defaultdict
 
 import networkx as nx
 
-# 确保 core_modules 可以被正确导入
+# 确保 original_programs 可以被正确导入
 _current_file = Path(__file__).resolve()
 _project_root = _current_file.parent.parent
 if str(_project_root) not in sys.path:
@@ -47,8 +47,8 @@ class CycloalkeneGenerator:
         if cycloalkane_generator is not None:
             self.cycloalkane_gen = cycloalkane_generator
         else:
-            from core_modules.cycloalkane_app import CycloalkaneGenerator
-            self.cycloalkane_gen = CycloalkaneGenerator()
+            from original_programs.multcycloalkane import PolycycloalkaneGenerator
+            self.cycloalkane_gen = PolycycloalkaneGenerator()
 
     def generate_isomers(self, n_carbons: int) -> List[nx.Graph]:
         """
@@ -148,7 +148,7 @@ class CycloalkeneGenerator:
         Returns:
             nx.Graph 列表，每个图表示一个环烷烃骨架。
         """
-        return self.cycloalkane_gen.generate_isomers(n_carbons)
+        return self.cycloalkane_gen.generate_isomers(n_carbons, n_rings=1, verbose=False)
 
     def graph_to_rdkit_mol(self, G: nx.Graph, optimize: bool = True) -> object:
         """
@@ -489,7 +489,7 @@ def main():
     print("=" * 70)
     print()
     print("算法: 环烷烃骨架 + 遍历加双键")
-    print("  Step 1: 生成所有 n 碳环烷烃骨架 (CycloalkaneGenerator)")
+    print("  Step 1: 生成所有 n 碳环烷烃骨架 (PolycycloalkaneGenerator)")
     print("  Step 2: 对每个骨架图，遍历所有边放置双键")
     print("  Step 3: WL 哈希分组 + 图同构去重")
     print()

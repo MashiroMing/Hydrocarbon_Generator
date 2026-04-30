@@ -9,7 +9,7 @@ import os
 if hasattr(sys, '_MEIPASS'):
     # 确保项目模块在 Python 路径中
     meipass = sys._MEIPASS
-    for subdir in ['original_programs', 'diene', 'core_modules']:
+    for subdir in ['original_programs']:
         p = os.path.join(meipass, subdir)
         if p not in sys.path:
             sys.path.insert(0, p)
