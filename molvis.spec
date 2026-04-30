@@ -141,7 +141,6 @@ a = Analysis(
         'test', 'pytest', 'IPython', 'notebook', 'jupyter', 'sphinx', 'docutils',
         'PySide6', 'PyQt6', 'PySide2',
         'qtpy', 'zmq', 'sqlalchemy', 'tables', 'lxml',
-        'tkinter', 'tkinter.filedialog', 'tkinter.scrolledtext',
         'MAYGEN', 'MolGen',
     ],
 )

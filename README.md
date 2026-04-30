@@ -103,7 +103,7 @@ python Main.py
 
 ## 打包发布
 
-使用 PyInstaller 进行目录模式打包。
+项目提供了 PyInstaller 的 `.spec` 配置文件，可直接用于目录模式打包。
 
 **Windows：**
 
@@ -118,6 +118,21 @@ pyinstaller molvis_linux.spec
 ```
 
 打包产物均位于 `dist/molvis/` 目录下。
+
+### 自定义打包配置
+
+如果你需要自行封装，请修改 `.spec` 文件中的以下内容：
+
+| 配置项 | 所在文件 | 说明 |
+|---|---|---|
+| `name` | `EXE()` 中的 `name='molvis'` | 可执行文件名称 |
+| `icon` | `EXE()` 中的 `icon=os.path.join(root_dir, 'icon.ico')` | 应用图标路径 |
+| `console` | `EXE()` 中的 `console=True` | 设为 `False` 可隐藏控制台窗口 |
+| `datas` | `Analysis()` 中 | 需要打包的额外数据文件/目录 |
+| `hiddenimports` | `Analysis()` 中 | PyInstaller 无法自动检测的隐式依赖 |
+| `excludes` | `Analysis()` 中 | 需要排除的模块（可减小打包体积） |
+
+> **注意**：请勿将 `tkinter` 加入 `excludes` 列表，否则 GUI 将无法正常运行。
 
 ### 运行打包后的程序
 

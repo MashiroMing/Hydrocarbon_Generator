@@ -2299,6 +2299,9 @@ class MoleculeApp:
                     result_c = {i: (float(c[0]), float(c[1]), float(c[2]))
                                 for i, c in new_c_coords.items()}
 
+                    # 修正非键连原子碰撞
+                    result_c = self._resolve_atom_collisions(G, result_c)
+
                     # 同步偏移氢原子坐标
                     result_h = list(h_coords)
                     for h_i in range(len(result_h)):
@@ -2309,6 +2312,12 @@ class MoleculeApp:
                                 result_h[h_i] = (float(h_coord[0]), float(h_coord[1]), float(h_coord[2]))
 
                     # 缩放C-H键长至真实键长1.09Å（Compute2DCoords默认C-H距离~1.5Å，GaussView无法识别）
+                    result_h = self._scale_ch_bond_lengths(result_c, result_h, h_to_c)
+
+                    # 如果坐标是纯平面(2D回退)，添加Z轴扰动生成合理的3D构象
+                    result_c, result_h = self._add_z_perturbation(G, result_c, result_h, h_to_c)
+
+                    # Z扰动可能改变了C-H键长，重新缩放
                     result_h = self._scale_ch_bond_lengths(result_c, result_h, h_to_c)
 
                     return result_c, result_h
@@ -2363,6 +2372,9 @@ class MoleculeApp:
             result_c = {i: (float(c[0]), float(c[1]), float(c[2]))
                         for i, c in new_c_coords.items()}
 
+            # 修正非键连原子碰撞
+            result_c = self._resolve_atom_collisions(G, result_c)
+
             # 同步偏移氢原子坐标
             result_h = list(h_coords)
             for h_i in range(len(result_h)):
@@ -2373,6 +2385,12 @@ class MoleculeApp:
                         result_h[h_i] = (float(h_coord[0]), float(h_coord[1]), float(h_coord[2]))
 
             # 缩放C-H键长至真实键长1.09Å（Compute2DCoords默认C-H距离~1.5Å，GaussView无法识别）
+            result_h = self._scale_ch_bond_lengths(result_c, result_h, h_to_c)
+
+            # 如果坐标是纯平面(2D回退)，添加Z轴扰动生成合理的3D构象
+            result_c, result_h = self._add_z_perturbation(G, result_c, result_h, h_to_c)
+
+            # Z扰动可能改变了C-H键长，重新缩放
             result_h = self._scale_ch_bond_lengths(result_c, result_h, h_to_c)
 
             return result_c, result_h
@@ -2423,6 +2441,9 @@ class MoleculeApp:
             new_coord = np.array(coord) + c_offsets.get(i, np.zeros(3))
             new_c_coords[i] = (float(new_coord[0]), float(new_coord[1]), float(new_coord[2]))
 
+        # 修正非键连原子碰撞
+        new_c_coords = self._resolve_atom_collisions(G, new_c_coords)
+
         # 同步偏移氢原子坐标
         new_h_coords = list(h_coords)
         for h_i in range(len(new_h_coords)):
@@ -2434,7 +2455,258 @@ class MoleculeApp:
         # 缩放C-H键长至真实键长1.09Å（Compute2DCoords默认C-H距离~1.5Å，GaussView无法识别）
         new_h_coords = self._scale_ch_bond_lengths(new_c_coords, new_h_coords, h_to_c)
 
+        # 如果坐标是纯平面(2D回退)，添加Z轴扰动生成合理的3D构象
+        new_c_coords, new_h_coords = self._add_z_perturbation(G, new_c_coords, new_h_coords, h_to_c)
+
+        # Z扰动可能改变了C-H键长，重新缩放
+        new_h_coords = self._scale_ch_bond_lengths(new_c_coords, new_h_coords, h_to_c)
+
         return new_c_coords, new_h_coords
+
+    def _resolve_atom_collisions(self, G, c_coords, min_dist=0.8):
+        """检测并修正非键连碳原子之间的碰撞（距离过近）
+
+        RDKit 的 Compute2DCoords 对某些多环/稠环分子可能生成原子重叠的2D坐标，
+        导致 GaussView 显示异常。此函数对非键连且距离 < min_dist 的原子对施加排斥力。
+
+        Args:
+            G: networkx 图对象
+            c_coords: 碳原子坐标字典 {node_id: (x, y, z)}
+            min_dist: 非键连碳原子间最小允许距离（Å）
+
+        Returns:
+            修正后的碳原子坐标字典
+        """
+        import numpy as np
+
+        if not c_coords or len(c_coords) < 2:
+            return c_coords
+
+        # 建立键连关系集合
+        bonded = set()
+        for u, v in G.edges():
+            bonded.add((min(u, v), max(u, v)))
+
+        new_coords = {i: np.array(coord, dtype=float) for i, coord in c_coords.items()}
+        nodes = sorted(new_coords.keys())
+
+        # 迭代排斥力修正（最多50轮，避免死循环）
+        for iteration in range(50):
+            max_violation = 0.0
+            offsets = {i: np.zeros(3) for i in nodes}
+
+            for i_idx in range(len(nodes)):
+                for j_idx in range(i_idx + 1, len(nodes)):
+                    i, j = nodes[i_idx], nodes[j_idx]
+                    # 跳过键连原子
+                    if (min(i, j), max(i, j)) in bonded:
+                        continue
+                    pi = new_coords[i]
+                    pj = new_coords[j]
+                    vec = pj - pi
+                    dist = np.linalg.norm(vec)
+                    if dist < min_dist and dist > 1e-8:
+                        violation = min_dist - dist
+                        max_violation = max(max_violation, violation)
+                        # 排斥力：将两个原子沿连线方向各推一半
+                        push = vec / dist * violation * 0.5 * 1.1  # 1.1倍确保超过阈值
+                        offsets[i] -= push
+                        offsets[j] += push
+
+            if max_violation < 0.01:
+                break
+
+            # 应用偏移
+            for i in nodes:
+                new_coords[i] = new_coords[i] + offsets[i]
+
+        return {i: (float(c[0]), float(c[1]), float(c[2])) for i, c in new_coords.items()}
+
+    def _add_z_perturbation(self, G, c_coords, h_coords, h_to_c):
+        """对纯平面(2D)坐标添加Z轴扰动并优化，生成合理的3D构象
+
+        当RDKit 3D嵌入失败回退到Compute2DCoords时，Z坐标全为0，
+        非键连原子可能因2D投影距离过近导致GaussView误判键连接。
+        此方法通过Z偏移+XY微调+迭代力场优化，确保：
+        1) 所有键连原子距离接近真实键长
+        2) 所有非键连原子3D距离 >= 阈值（避免GaussView误判）
+
+        对于苯环等单环共轭体系，2D坐标中非键连原子距离已在安全范围内，
+        不会施加Z扰动，保持其平面芳香性。
+
+        策略：
+        1. 检查是否存在2D距离 < MIN_NONBOND的非键连冲突对
+        2. 若无冲突，直接返回（保持平面结构如苯环）
+        3. 若有冲突，构建冲突图二部着色分配Z符号
+        4. 施加初始Z偏移
+        5. 迭代力场优化：键约束 + 非键排斥，直到收敛
+
+        Args:
+            G: networkx 图对象
+            c_coords: 碳原子坐标字典 {node_id: (x, y, z)}
+            h_coords: 氢原子坐标列表 [(x, y, z), ...]
+            h_to_c: 氢原子索引到碳原子索引的映射 {h_idx: c_idx}
+
+        Returns:
+            (c_coords, h_coords) 修正后的坐标
+        """
+        import numpy as np
+        import networkx as nx
+        import math
+
+        # 检查是否真的是纯平面坐标
+        max_z = max(abs(c[2]) for c in c_coords.values()) if c_coords else 0
+        if max_z > 0.1:
+            return c_coords, h_coords  # 已有3D坐标，不需要处理
+
+        # 建立键连关系集合
+        bonded = set()
+        for u, v in G.edges():
+            bonded.add((min(u, v), max(u, v)))
+
+        TARGET_SINGLE = 1.54   # C-C单键目标键长
+        TARGET_DOUBLE_BOND = 1.34  # C=C双键目标键长
+        MIN_NONBOND = 1.8     # 非键连原子3D最小距离（GaussView C-C成键阈值~1.7A，需留余量）
+
+        # --- Step 1: 找出2D近距离非键连冲突对 ---
+        # 只有2D距离 < MIN_NONBOND的非键连对才真正需要Z扰动来解决
+        # 2D距离已 >= MIN_NONBOND的对在3D中不会误判，无需处理
+        nodes = sorted(c_coords.keys())
+        critical_conflicts = []  # 2D距离 < MIN_NONBOND，真正需要解决的冲突
+        moderate_conflicts = []  # 2D距离 < CONFLICT_DIST 但 >= MIN_NONBOND
+        CONFLICT_DIST = 2.5
+        for i_idx in range(len(nodes)):
+            for j_idx in range(i_idx + 1, len(nodes)):
+                i, j = nodes[i_idx], nodes[j_idx]
+                if (min(i, j), max(i, j)) in bonded:
+                    continue
+                pi = c_coords[i]
+                pj = c_coords[j]
+                d2d = math.sqrt((pi[0] - pj[0]) ** 2 + (pi[1] - pj[1]) ** 2)
+                if d2d < MIN_NONBOND:
+                    critical_conflicts.append((i, j, d2d))
+                elif d2d < CONFLICT_DIST:
+                    moderate_conflicts.append((i, j, d2d))
+
+        # 若无关键冲突，说明2D坐标中所有非键连距离已安全，不需要Z扰动
+        # 这样可以保持苯环等单环共轭体系的平面芳香性
+        if not critical_conflicts:
+            return c_coords, h_coords
+
+        # --- Step 2: 冲突图二部着色 -> Z符号 ---
+        # 使用关键冲突对构建冲突图（2D距离 < MIN_NONBOND的真正需要Z扰动的对）
+        z_sign = {}
+        if critical_conflicts:
+            CG = nx.Graph()
+            for i in c_coords:
+                CG.add_node(i)
+            for i, j, d in critical_conflicts:
+                CG.add_edge(i, j)
+
+            from networkx.algorithms import bipartite as bp_module
+            if bp_module.is_bipartite(CG):
+                color = bp_module.color(CG)
+                z_sign = {node: 1 if color[node] == 0 else -1 for node in color}
+            else:
+                # 贪心着色：最近的冲突对优先分配相反符号
+                sorted_conflicts = sorted(critical_conflicts, key=lambda x: x[2])
+                for i, j, d in sorted_conflicts:
+                    si = z_sign.get(i)
+                    sj = z_sign.get(j)
+                    if si is not None and sj is not None:
+                        continue
+                    elif si is not None and sj is None:
+                        z_sign[j] = -si
+                    elif sj is not None and si is None:
+                        z_sign[i] = -sj
+                    else:
+                        z_sign[i] = 1
+                        z_sign[j] = -1
+
+        # 对没有分配Z符号的原子补全（仅在有关键冲突时需要）
+        for node in c_coords:
+            if node not in z_sign:
+                neighbor_signs = [z_sign[nb] for nb in G.neighbors(node) if nb in z_sign]
+                if neighbor_signs:
+                    avg = sum(neighbor_signs) / len(neighbor_signs)
+                    z_sign[node] = -1 if avg > 0 else 1
+                else:
+                    z_sign[node] = 1 if node % 2 == 0 else -1
+
+        # --- Step 3: 施加初始Z偏移 ---
+        Z_SCALE = 1.0
+        coords = {}
+        for i, (x, y, z) in c_coords.items():
+            coords[i] = np.array([x, y, z + z_sign.get(i, 0) * Z_SCALE], dtype=float)
+
+        # 收集键类型信息
+        bond_targets = {}
+        for u, v, data in G.edges(data=True):
+            bt = data.get('bond_type', 'single')
+            target = TARGET_DOUBLE_BOND if bt == 'double' else TARGET_SINGLE
+            bond_targets[(u, v)] = target
+            bond_targets[(v, u)] = target
+
+        # --- Step 4: 迭代力场优化 ---
+        for iteration in range(500):
+            offsets = {i: np.zeros(3) for i in coords}
+            max_error = 0.0
+
+            # 键约束（适度刚度）
+            for u, v in G.edges():
+                target = bond_targets.get((u, v), TARGET_SINGLE)
+                vec = coords[v] - coords[u]
+                dist = np.linalg.norm(vec)
+                if dist < 1e-8:
+                    continue
+                error = dist - target
+                max_error = max(max_error, abs(error) * 0.5)
+                correction = vec / dist * error * 0.15
+                offsets[u] += correction
+                offsets[v] -= correction
+
+            # 非键排斥（强排斥，确保不误判成键）
+            for i_idx in range(len(nodes)):
+                for j_idx in range(i_idx + 1, len(nodes)):
+                    i, j = nodes[i_idx], nodes[j_idx]
+                    if (min(i, j), max(i, j)) in bonded:
+                        continue
+                    if i not in coords or j not in coords:
+                        continue
+                    vec = coords[j] - coords[i]
+                    dist = np.linalg.norm(vec)
+                    if dist < MIN_NONBOND and dist > 1e-8:
+                        violation = MIN_NONBOND - dist
+                        max_error = max(max_error, violation)
+                        # 距离越近排斥越强，使用1/violation作为权重确保极近距离也能推开
+                        weight = max(1.5, MIN_NONBOND / max(violation, 0.1))
+                        push = vec / dist * violation * 0.5 * weight
+                        offsets[i] -= push
+                        offsets[j] += push
+
+            # 应用偏移（阻尼0.4防止振荡）
+            for i in coords:
+                coords[i] += offsets[i] * 0.4
+
+            if max_error < 0.005:
+                break
+
+        # --- Step 5: 输出结果 ---
+        new_c = {i: (float(c[0]), float(c[1]), float(c[2])) for i, c in coords.items()}
+
+        # 氢原子跟随碳原子的偏移
+        new_h = []
+        for h_i, (x, y, z) in enumerate(h_coords):
+            c_i = h_to_c.get(h_i)
+            if c_i is not None and c_i in new_c and c_i in c_coords:
+                dx = new_c[c_i][0] - c_coords[c_i][0]
+                dy = new_c[c_i][1] - c_coords[c_i][1]
+                dz = new_c[c_i][2] - c_coords[c_i][2]
+                new_h.append((x + dx, y + dy, z + dz * 0.5))
+            else:
+                new_h.append((x, y, z))
+
+        return new_c, new_h
 
     def _scale_ch_bond_lengths(self, c_coords, h_coords, h_to_c):
         """将C-H键长缩放至真实键长1.09Å
@@ -3118,8 +3390,57 @@ class MoleculeApp:
                 Chem.SanitizeMol(mol)
                 mol = Chem.AddHs(mol)
 
-                # 环烷烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-                AllChem.Compute2DCoords(mol)
+                # 二烯烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+                has_ring = len(nx.cycle_basis(G)) > 0
+                if has_ring:
+                    import math as _math
+                    best_mol = None
+                    best_max_bond = float('inf')
+                    for seed in range(50):
+                        mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                        params = AllChem.ETKDGv3()
+                        params.randomSeed = seed
+                        result = AllChem.EmbedMolecule(mol_trial, params)
+                        if result == -1:
+                            result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                            if result2 == -1:
+                                continue
+                        try:
+                            AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                        except Exception:
+                            pass
+                        conf = mol_trial.GetConformer()
+                        max_bond = 0.0
+                        for u, v in G.edges():
+                            if u < n_carbons and v < n_carbons:
+                                p1 = conf.GetAtomPosition(u)
+                                p2 = conf.GetAtomPosition(v)
+                                dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                                max_bond = max(max_bond, dist)
+                        if max_bond < best_max_bond:
+                            best_max_bond = max_bond
+                            best_mol = Chem.Mol(mol_trial.ToBinary())
+                    if best_mol is not None:
+                        mol = best_mol
+                    else:
+                        AllChem.Compute2DCoords(mol)
+                else:
+                    # 非环二烯烃：使用单种子3D嵌入
+                    embed_ok = False
+                    result = AllChem.EmbedMolecule(mol, randomSeed=42)
+                    if result != -1:
+                        embed_ok = True
+                    else:
+                        result2 = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
+                        if result2 != -1:
+                            embed_ok = True
+                    if not embed_ok:
+                        AllChem.Compute2DCoords(mol)
+                    else:
+                        try:
+                            AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+                        except Exception:
+                            pass
 
                 # 提取坐标
                 c_coords = {}
@@ -3210,8 +3531,38 @@ class MoleculeApp:
                 Chem.SanitizeMol(mol)
                 mol = Chem.AddHs(mol)
 
-                # 单环烯烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-                AllChem.Compute2DCoords(mol)
+                # 单环烯烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+                import math as _math
+                best_mol = None
+                best_max_bond = float('inf')
+                for seed in range(50):
+                    mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                    params = AllChem.ETKDGv3()
+                    params.randomSeed = seed
+                    result = AllChem.EmbedMolecule(mol_trial, params)
+                    if result == -1:
+                        result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                        if result2 == -1:
+                            continue
+                    try:
+                        AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                    except Exception:
+                        pass
+                    conf = mol_trial.GetConformer()
+                    max_bond = 0.0
+                    for u, v in G.edges():
+                        if u < n_carbons and v < n_carbons:
+                            p1 = conf.GetAtomPosition(u)
+                            p2 = conf.GetAtomPosition(v)
+                            dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                            max_bond = max(max_bond, dist)
+                    if max_bond < best_max_bond:
+                        best_max_bond = max_bond
+                        best_mol = Chem.Mol(mol_trial.ToBinary())
+                if best_mol is not None:
+                    mol = best_mol
+                else:
+                    AllChem.Compute2DCoords(mol)
 
                 # 提取坐标
                 conf = mol.GetConformer()
@@ -3276,8 +3627,38 @@ class MoleculeApp:
                 Chem.SanitizeMol(mol)
                 mol = Chem.AddHs(mol)
 
-                # 单环多烯烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-                AllChem.Compute2DCoords(mol)
+                # 单环多烯烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+                import math as _math
+                best_mol = None
+                best_max_bond = float('inf')
+                for seed in range(50):
+                    mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                    params = AllChem.ETKDGv3()
+                    params.randomSeed = seed
+                    result = AllChem.EmbedMolecule(mol_trial, params)
+                    if result == -1:
+                        result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                        if result2 == -1:
+                            continue
+                    try:
+                        AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                    except Exception:
+                        pass
+                    conf = mol_trial.GetConformer()
+                    max_bond = 0.0
+                    for u, v in G.edges():
+                        if u < n_carbons and v < n_carbons:
+                            p1 = conf.GetAtomPosition(u)
+                            p2 = conf.GetAtomPosition(v)
+                            dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                            max_bond = max(max_bond, dist)
+                    if max_bond < best_max_bond:
+                        best_max_bond = max_bond
+                        best_mol = Chem.Mol(mol_trial.ToBinary())
+                if best_mol is not None:
+                    mol = best_mol
+                else:
+                    AllChem.Compute2DCoords(mol)
 
                 # 提取坐标
                 conf = mol.GetConformer()
@@ -3730,8 +4111,38 @@ class MoleculeApp:
             Chem.SanitizeMol(mol)
             mol = Chem.AddHs(mol)
 
-            # 单环烯烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-            AllChem.Compute2DCoords(mol)
+            # 单环烯烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+            import math as _math
+            best_mol = None
+            best_max_bond = float('inf')
+            for seed in range(50):
+                mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                params = AllChem.ETKDGv3()
+                params.randomSeed = seed
+                result = AllChem.EmbedMolecule(mol_trial, params)
+                if result == -1:
+                    result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                    if result2 == -1:
+                        continue
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                except Exception:
+                    pass
+                conf = mol_trial.GetConformer()
+                max_bond = 0.0
+                for u, v in G.edges():
+                    if u < n_carbons and v < n_carbons:
+                        p1 = conf.GetAtomPosition(u)
+                        p2 = conf.GetAtomPosition(v)
+                        dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                        max_bond = max(max_bond, dist)
+                if max_bond < best_max_bond:
+                    best_max_bond = max_bond
+                    best_mol = Chem.Mol(mol_trial.ToBinary())
+            if best_mol is not None:
+                mol = best_mol
+            else:
+                AllChem.Compute2DCoords(mol)
 
             # 提取坐标
             conf = mol.GetConformer()
@@ -3763,30 +4174,37 @@ class MoleculeApp:
                         if node in c_coords and neighbor in c_coords:
                             is_double = G[node][neighbor].get('bond_type') == 'double'
                             if is_double:
-                                # 双键绘制两条平行线
+                                # 双键：主线 + 偏移缩短线
                                 import numpy as np
                                 p1 = np.array(c_coords[node])
                                 p2 = np.array(c_coords[neighbor])
-                                mid = (p1 + p2) / 2
                                 direction = p2 - p1
                                 length = np.linalg.norm(direction)
-                                if length > 0:
-                                    # 找一个垂直方向
-                                    if abs(direction[0]) < abs(direction[1]):
-                                        perp = np.cross(direction, [1, 0, 0])
-                                    else:
-                                        perp = np.cross(direction, [0, 1, 0])
-                                    perp = perp / np.linalg.norm(perp) * 0.15
+                                if length > 1e-8:
+                                    # 垂直方向（在分子所在平面内偏移）
+                                    mid = (p1 + p2) / 2
+                                    up = np.array([0, 0, 1])
+                                    perp = np.cross(direction, up)
+                                    perp_norm = np.linalg.norm(perp)
+                                    if perp_norm < 1e-8:
+                                        perp = np.cross(direction, np.array([0, 1, 0]))
+                                        perp_norm = np.linalg.norm(perp)
+                                    perp = perp / perp_norm * length * 0.04
+                                    # 主线（不偏移，连接两碳原子）
                                     ax.plot(
-                                        [p1[0] + perp[0], p2[0] + perp[0]],
-                                        [p1[1] + perp[1], p2[1] + perp[1]],
-                                        [p1[2] + perp[2], p2[2] + perp[2]],
+                                        [p1[0], p2[0]],
+                                        [p1[1], p2[1]],
+                                        [p1[2], p2[2]],
                                         color='red', linewidth=3
                                     )
+                                    # 第二条线：缩短至键中段 + 偏移
+                                    t1, t2 = 0.25, 0.75
+                                    sp1 = p1 + direction * t1 + perp
+                                    sp2 = p1 + direction * t2 + perp
                                     ax.plot(
-                                        [p1[0] - perp[0], p2[0] - perp[0]],
-                                        [p1[1] - perp[1], p2[1] - perp[1]],
-                                        [p1[2] - perp[2], p2[2] - perp[2]],
+                                        [sp1[0], sp2[0]],
+                                        [sp1[1], sp2[1]],
+                                        [sp1[2], sp2[2]],
                                         color='red', linewidth=3
                                     )
                                 else:
@@ -3925,8 +4343,38 @@ class MoleculeApp:
             Chem.SanitizeMol(mol)
             mol = Chem.AddHs(mol)
 
-            # 单环多烯烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-            AllChem.Compute2DCoords(mol)
+            # 单环多烯烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+            import math as _math
+            best_mol = None
+            best_max_bond = float('inf')
+            for seed in range(50):
+                mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                params = AllChem.ETKDGv3()
+                params.randomSeed = seed
+                result = AllChem.EmbedMolecule(mol_trial, params)
+                if result == -1:
+                    result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                    if result2 == -1:
+                        continue
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                except Exception:
+                    pass
+                conf = mol_trial.GetConformer()
+                max_bond = 0.0
+                for u, v in G.edges():
+                    if u < n_carbons and v < n_carbons:
+                        p1 = conf.GetAtomPosition(u)
+                        p2 = conf.GetAtomPosition(v)
+                        dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                        max_bond = max(max_bond, dist)
+                if max_bond < best_max_bond:
+                    best_max_bond = max_bond
+                    best_mol = Chem.Mol(mol_trial.ToBinary())
+            if best_mol is not None:
+                mol = best_mol
+            else:
+                AllChem.Compute2DCoords(mol)
 
             # 提取坐标
             conf = mol.GetConformer()
@@ -4002,27 +4450,34 @@ class MoleculeApp:
                         if node in c_coords and neighbor in c_coords:
                             is_double = G[node][neighbor].get('bond_type') == 'double'
                             if is_double:
-                                # 双键绘制两条平行线
+                                # 双键：主线 + 偏移缩短线
                                 p1 = np.array(c_coords[node])
                                 p2 = np.array(c_coords[neighbor])
                                 direction = p2 - p1
                                 length = np.linalg.norm(direction)
-                                if length > 0:
-                                    if abs(direction[0]) < abs(direction[1]):
-                                        perp = np.cross(direction, [1, 0, 0])
-                                    else:
-                                        perp = np.cross(direction, [0, 1, 0])
-                                    perp = perp / np.linalg.norm(perp) * 0.15
+                                if length > 1e-8:
+                                    up = np.array([0, 0, 1])
+                                    perp = np.cross(direction, up)
+                                    perp_norm = np.linalg.norm(perp)
+                                    if perp_norm < 1e-8:
+                                        perp = np.cross(direction, np.array([0, 1, 0]))
+                                        perp_norm = np.linalg.norm(perp)
+                                    perp = perp / perp_norm * length * 0.04
+                                    # 主线
                                     ax.plot(
-                                        [p1[0] + perp[0], p2[0] + perp[0]],
-                                        [p1[1] + perp[1], p2[1] + perp[1]],
-                                        [p1[2] + perp[2], p2[2] + perp[2]],
+                                        [p1[0], p2[0]],
+                                        [p1[1], p2[1]],
+                                        [p1[2], p2[2]],
                                         color='red', linewidth=3
                                     )
+                                    # 第二条缩短偏移线
+                                    t1, t2 = 0.25, 0.75
+                                    sp1 = p1 + direction * t1 + perp
+                                    sp2 = p1 + direction * t2 + perp
                                     ax.plot(
-                                        [p1[0] - perp[0], p2[0] - perp[0]],
-                                        [p1[1] - perp[1], p2[1] - perp[1]],
-                                        [p1[2] - perp[2], p2[2] - perp[2]],
+                                        [sp1[0], sp2[0]],
+                                        [sp1[1], sp2[1]],
+                                        [sp1[2], sp2[2]],
                                         color='red', linewidth=3
                                     )
                                 else:
@@ -4227,48 +4682,51 @@ class MoleculeApp:
                             length = np.linalg.norm(direction)
 
                             if bond_key in triple_bond_edges:
-                                # 三键：三条平行线
-                                if length > 0:
-                                    if abs(direction[0]) < abs(direction[1]):
-                                        perp = np.cross(direction, [1, 0, 0])
-                                    else:
-                                        perp = np.cross(direction, [0, 1, 0])
-                                    perp = perp / np.linalg.norm(perp) * 0.12
-                                    for sign in [0, 1, -1]:
-                                        offset = perp * sign
-                                        ax.plot(
-                                            [p1[0] + offset[0], p2[0] + offset[0]],
-                                            [p1[1] + offset[1], p2[1] + offset[1]],
-                                            [p1[2] + offset[2], p2[2] + offset[2]],
-                                            color='#CC0000', linewidth=3
-                                        )
+                                # 三键：主线 + 两条偏移缩短线
+                                if length > 1e-8:
+                                    up = np.array([0, 0, 1])
+                                    perp = np.cross(direction, up)
+                                    perp_norm = np.linalg.norm(perp)
+                                    if perp_norm < 1e-8:
+                                        perp = np.cross(direction, np.array([0, 1, 0]))
+                                        perp_norm = np.linalg.norm(perp)
+                                    perp = perp / perp_norm * length * 0.04
+                                    # 主线
+                                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                                            color='#8B008B', linewidth=3)
+                                    # 两条缩短偏移线
+                                    t1, t2 = 0.25, 0.75
+                                    for sign in [1, -1]:
+                                        sp1 = p1 + direction * t1 + perp * sign
+                                        sp2 = p1 + direction * t2 + perp * sign
+                                        ax.plot([sp1[0], sp2[0]], [sp1[1], sp2[1]], [sp1[2], sp2[2]],
+                                                color='#8B008B', linewidth=2)
                                 else:
                                     ax.plot(
                                         [c_coords[node][0], c_coords[neighbor][0]],
                                         [c_coords[node][1], c_coords[neighbor][1]],
                                         [c_coords[node][2], c_coords[neighbor][2]],
-                                        color='#CC0000', linewidth=3
+                                        color='#8B008B', linewidth=3
                                     )
                             elif bond_key in double_bond_edges:
-                                # 双键：两条平行线
-                                if length > 0:
-                                    if abs(direction[0]) < abs(direction[1]):
-                                        perp = np.cross(direction, [1, 0, 0])
-                                    else:
-                                        perp = np.cross(direction, [0, 1, 0])
-                                    perp = perp / np.linalg.norm(perp) * 0.12
-                                    ax.plot(
-                                        [p1[0] + perp[0], p2[0] + perp[0]],
-                                        [p1[1] + perp[1], p2[1] + perp[1]],
-                                        [p1[2] + perp[2], p2[2] + perp[2]],
-                                        color='#FF6600', linewidth=3
-                                    )
-                                    ax.plot(
-                                        [p1[0] - perp[0], p2[0] - perp[0]],
-                                        [p1[1] - perp[1], p2[1] - perp[1]],
-                                        [p1[2] - perp[2], p2[2] - perp[2]],
-                                        color='#FF6600', linewidth=3
-                                    )
+                                # 双键：主线 + 偏移缩短线
+                                if length > 1e-8:
+                                    up = np.array([0, 0, 1])
+                                    perp = np.cross(direction, up)
+                                    perp_norm = np.linalg.norm(perp)
+                                    if perp_norm < 1e-8:
+                                        perp = np.cross(direction, np.array([0, 1, 0]))
+                                        perp_norm = np.linalg.norm(perp)
+                                    perp = perp / perp_norm * length * 0.04
+                                    # 主线
+                                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                                            color='#FF6600', linewidth=3)
+                                    # 第二条缩短偏移线
+                                    t1, t2 = 0.25, 0.75
+                                    sp1 = p1 + direction * t1 + perp
+                                    sp2 = p1 + direction * t2 + perp
+                                    ax.plot([sp1[0], sp2[0]], [sp1[1], sp2[1]], [sp1[2], sp2[2]],
+                                            color='#FF6600', linewidth=3)
                                 else:
                                     ax.plot(
                                         [c_coords[node][0], c_coords[neighbor][0]],
@@ -4452,24 +4910,23 @@ class MoleculeApp:
                             length = np.linalg.norm(direction)
 
                             if bond_key in double_bond_edges:
-                                if length > 0:
-                                    if abs(direction[0]) < abs(direction[1]):
-                                        perp = np.cross(direction, [1, 0, 0])
-                                    else:
-                                        perp = np.cross(direction, [0, 1, 0])
-                                    perp = perp / np.linalg.norm(perp) * 0.12
-                                    ax.plot(
-                                        [p1[0]+perp[0], p2[0]+perp[0]],
-                                        [p1[1]+perp[1], p2[1]+perp[1]],
-                                        [p1[2]+perp[2], p2[2]+perp[2]],
-                                        color='#FF6600', linewidth=3
-                                    )
-                                    ax.plot(
-                                        [p1[0]-perp[0], p2[0]-perp[0]],
-                                        [p1[1]-perp[1], p2[1]-perp[1]],
-                                        [p1[2]-perp[2], p2[2]-perp[2]],
-                                        color='#FF6600', linewidth=3
-                                    )
+                                if length > 1e-8:
+                                    up = np.array([0, 0, 1])
+                                    perp = np.cross(direction, up)
+                                    perp_norm = np.linalg.norm(perp)
+                                    if perp_norm < 1e-8:
+                                        perp = np.cross(direction, np.array([0, 1, 0]))
+                                        perp_norm = np.linalg.norm(perp)
+                                    perp = perp / perp_norm * length * 0.04
+                                    # 主线
+                                    ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                                            color='#FF6600', linewidth=3)
+                                    # 第二条缩短偏移线
+                                    t1, t2 = 0.25, 0.75
+                                    sp1 = p1 + direction * t1 + perp
+                                    sp2 = p1 + direction * t2 + perp
+                                    ax.plot([sp1[0], sp2[0]], [sp1[1], sp2[1]], [sp1[2], sp2[2]],
+                                            color='#FF6600', linewidth=3)
                             else:
                                 ax.plot(
                                     [c_coords[node][0], c_coords[neighbor][0]],
@@ -4580,8 +5037,38 @@ class MoleculeApp:
             Chem.SanitizeMol(mol)
             mol = Chem.AddHs(mol)
 
-            # 环烷烃：优先使用2D坐标（保证环几何正确性，避免MMFF对高张力环产生畸变）
-            AllChem.Compute2DCoords(mol)
+            # 环烷烃：先尝试3D嵌入+MMFF优化，失败回退2D坐标
+            import math as _math
+            best_mol = None
+            best_max_bond = float('inf')
+            for seed in range(50):
+                mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                params = AllChem.ETKDGv3()
+                params.randomSeed = seed
+                result = AllChem.EmbedMolecule(mol_trial, params)
+                if result == -1:
+                    result2 = AllChem.EmbedMolecule(mol_trial, randomSeed=seed, useRandomCoords=True)
+                    if result2 == -1:
+                        continue
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                except Exception:
+                    pass
+                conf = mol_trial.GetConformer()
+                max_bond = 0.0
+                for u, v in G.edges():
+                    if u < n_carbons and v < n_carbons:
+                        p1 = conf.GetAtomPosition(u)
+                        p2 = conf.GetAtomPosition(v)
+                        dist = _math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+                        max_bond = max(max_bond, dist)
+                if max_bond < best_max_bond:
+                    best_max_bond = max_bond
+                    best_mol = Chem.Mol(mol_trial.ToBinary())
+            if best_mol is not None:
+                mol = best_mol
+            else:
+                AllChem.Compute2DCoords(mol)
 
             # 提取坐标
             c_coords = {}

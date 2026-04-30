@@ -507,48 +507,51 @@ class AlkenylIsomerGenerator:
                         length = np.linalg.norm(direction)
 
                         if bond_key in triple_bond_edges:
-                            # 三键：三条平行线
-                            if length > 0:
-                                if abs(direction[0]) < abs(direction[1]):
-                                    perp = np.cross(direction, [1, 0, 0])
-                                else:
-                                    perp = np.cross(direction, [0, 1, 0])
-                                perp = perp / np.linalg.norm(perp) * 0.12
-                                for sign in [0, 1, -1]:
-                                    offset = perp * sign
-                                    ax.plot(
-                                        [p1[0] + offset[0], p2[0] + offset[0]],
-                                        [p1[1] + offset[1], p2[1] + offset[1]],
-                                        [p1[2] + offset[2], p2[2] + offset[2]],
-                                        color='#CC0000', linewidth=3
-                                    )
+                            # 三键：主线 + 两条偏移缩短线
+                            if length > 1e-8:
+                                up = np.array([0, 0, 1])
+                                perp = np.cross(direction, up)
+                                perp_norm = np.linalg.norm(perp)
+                                if perp_norm < 1e-8:
+                                    perp = np.cross(direction, np.array([0, 1, 0]))
+                                    perp_norm = np.linalg.norm(perp)
+                                perp = perp / perp_norm * length * 0.04
+                                # 主线
+                                ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                                        color='#8B008B', linewidth=3)
+                                # 两条缩短偏移线
+                                t1, t2 = 0.25, 0.75
+                                for sign in [1, -1]:
+                                    sp1 = p1 + direction * t1 + perp * sign
+                                    sp2 = p1 + direction * t2 + perp * sign
+                                    ax.plot([sp1[0], sp2[0]], [sp1[1], sp2[1]], [sp1[2], sp2[2]],
+                                            color='#8B008B', linewidth=2)
                             else:
                                 ax.plot(
                                     [c_coords[node][0], c_coords[neighbor][0]],
                                     [c_coords[node][1], c_coords[neighbor][1]],
                                     [c_coords[node][2], c_coords[neighbor][2]],
-                                    color='#CC0000', linewidth=3
+                                    color='#8B008B', linewidth=3
                                 )
                         elif bond_key in double_bond_edges:
-                            # 双键：两条平行线
-                            if length > 0:
-                                if abs(direction[0]) < abs(direction[1]):
-                                    perp = np.cross(direction, [1, 0, 0])
-                                else:
-                                    perp = np.cross(direction, [0, 1, 0])
-                                perp = perp / np.linalg.norm(perp) * 0.12
-                                ax.plot(
-                                    [p1[0] + perp[0], p2[0] + perp[0]],
-                                    [p1[1] + perp[1], p2[1] + perp[1]],
-                                    [p1[2] + perp[2], p2[2] + perp[2]],
-                                    color='#FF6600', linewidth=3
-                                )
-                                ax.plot(
-                                    [p1[0] - perp[0], p2[0] - perp[0]],
-                                    [p1[1] - perp[1], p2[1] - perp[1]],
-                                    [p1[2] - perp[2], p2[2] - perp[2]],
-                                    color='#FF6600', linewidth=3
-                                )
+                            # 双键：主线 + 偏移缩短线
+                            if length > 1e-8:
+                                up = np.array([0, 0, 1])
+                                perp = np.cross(direction, up)
+                                perp_norm = np.linalg.norm(perp)
+                                if perp_norm < 1e-8:
+                                    perp = np.cross(direction, np.array([0, 1, 0]))
+                                    perp_norm = np.linalg.norm(perp)
+                                perp = perp / perp_norm * length * 0.04
+                                # 主线
+                                ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                                        color='#FF6600', linewidth=3)
+                                # 第二条缩短偏移线
+                                t1, t2 = 0.25, 0.75
+                                sp1 = p1 + direction * t1 + perp
+                                sp2 = p1 + direction * t2 + perp
+                                ax.plot([sp1[0], sp2[0]], [sp1[1], sp2[1]], [sp1[2], sp2[2]],
+                                        color='#FF6600', linewidth=3)
                             else:
                                 ax.plot(
                                     [c_coords[node][0], c_coords[neighbor][0]],
