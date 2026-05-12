@@ -952,7 +952,7 @@ class AlkeneIsomerVisualizer:
         elif HAS_ALKENE_GENERATOR:
             # 使用新的基于烷烃骨架的生成器
             self.generator = AlkeneIsomerGenerator(alkane_generator=None, num_cores=self.num_cores)
-            print(f"使用新的 AlkeneIsomerGenerator (核心数: {self.num_cores})")
+            print(f"使用CPU核心数: {self.num_cores}")
         else:
             self.generator = None
             print("警告: 未提供生成器且无法导入 AlkeneIsomerGenerator，烯烃生成功能可能受限")

@@ -28,3 +28,7 @@ temp/
 # CodeBuddy
 .codebuddy/
 
+# Third-party reference projects
+MAYGEN/
+PMG/
+

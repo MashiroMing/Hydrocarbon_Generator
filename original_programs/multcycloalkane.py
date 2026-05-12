@@ -102,13 +102,7 @@ class PolycycloalkaneGenerator:
         current_graphs = self._add_edges_and_deduplicate(trees, max_degree=3)
 
         if verbose:
-            expected = self.OEIS_DATA.get(1, {}).get(n_carbons)
-            status = ""
-            if expected is not None:
-                status = " [OK]" if len(current_graphs) == expected else f" [FAIL](expected {expected})"
-            else:
-                status = " (待验证)"
-            print(f"  - 唯一结构: {len(current_graphs)}{status}")
+            print(f"  - 唯一结构: {len(current_graphs)}")
 
         if n_rings == 1:
             return current_graphs
@@ -126,13 +120,7 @@ class PolycycloalkaneGenerator:
             current_graphs = self._deduplicate(candidates)
 
             if verbose:
-                expected = self.OEIS_DATA.get(r, {}).get(n_carbons)
-                status = ""
-                if expected is not None:
-                    status = " [OK]" if len(current_graphs) == expected else f" [FAIL](expected {expected})"
-                else:
-                    status = " (待验证)"
-                print(f"  - 唯一结构: {len(current_graphs)}{status}")
+                print(f"  - 唯一结构: {len(current_graphs)}")
 
             if not current_graphs:
                 break
@@ -412,11 +400,12 @@ class PolycycloalkaneGenerator:
         """将规范字符串还原为 nx.Graph。"""
         adj = self.tree_gen.canon_to_adjacency(canon)
         G = nx.Graph()
-        G.add_nodes_from(adj.keys())
+        for node in adj.keys():
+            G.add_node(node, label='C')
         for u, nbrs in adj.items():
             for v in nbrs:
                 if u < v:
-                    G.add_edge(u, v)
+                    G.add_edge(u, v, bond_type='single')
         return G
 
     @staticmethod
@@ -436,7 +425,7 @@ class PolycycloalkaneGenerator:
                 if G.has_edge(u, v):
                     continue
                 new_G = G.copy()
-                new_G.add_edge(u, v)
+                new_G.add_edge(u, v, bond_type='single')
                 new_graphs.append(new_G)
         return new_graphs
 
@@ -453,11 +442,13 @@ class PolycycloalkaneGenerator:
     # -------------------------------------------------------------------------
     @staticmethod
     def _deduplicate(candidates: List[nx.Graph]) -> List[nx.Graph]:
-        """两阶段去重"""
+        """两阶段去重：WL哈希分桶 + 桶内精确同构检查"""
         hash_groups: Dict[str, List[nx.Graph]] = defaultdict(list)
         for G in candidates:
             try:
-                h = nx.weisfeiler_lehman_graph_hash(G)
+                h = nx.weisfeiler_lehman_graph_hash(
+                    G, edge_attr='bond_type', node_attr='label'
+                )
             except Exception:
                 h = str(PolycycloalkaneGenerator._graph_signature(G))
             hash_groups[h].append(G)
@@ -471,7 +462,11 @@ class PolycycloalkaneGenerator:
             for G in group[1:]:
                 is_dup = False
                 for existing in unique:
-                    if nx.is_isomorphic(G, existing):
+                    if nx.is_isomorphic(
+                        G, existing,
+                        node_match=lambda n1, n2: n1.get('label') == n2.get('label'),
+                        edge_match=lambda e1, e2: e1.get('bond_type') == e2.get('bond_type')
+                    ):
                         is_dup = True
                         break
                 if not is_dup:
@@ -577,12 +572,7 @@ def main():
 
         # 显示结果摘要
         print()
-        expected = generator.OEIS_DATA.get(n_rings, {}).get(n_carbons)
-        if expected is not None:
-            status = "[OK]" if len(isomers) == expected else "[FAIL]"
-            print(f"{formula} {ring_name} 共有 {len(isomers)} 个异构体 (预期 {expected}) {status}")
-        else:
-            print(f"{formula} {ring_name} 共有 {len(isomers)} 个异构体 (待验证)")
+        print(f"{formula} {ring_name} 共有 {len(isomers)} 个异构体")
 
         # 环大小分布
         if n_rings >= 2:

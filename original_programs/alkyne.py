@@ -50,28 +50,6 @@ def configure_chinese_font():
 
 configure_chinese_font()
 
-def get_alkyne_graph_signature(G):
-    """生成炔烃图的签名字符串（包含三键信息和邻接结构）"""
-    n = G.number_of_nodes()
-    if n == 0:
-        return "empty"
-
-    nodes = sorted(G.nodes())
-    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
-
-    triple_bond_edges = []
-    for u, v, data in G.edges(data=True):
-        if data.get('bond_type') == 'triple':
-            triple_bond_edges.append((node_to_idx[u], node_to_idx[v]))
-    triple_bond_edges.sort()
-
-    adj_str_parts = []
-    for node in nodes:
-        neighbors = sorted([node_to_idx[nbr] for nbr in G.neighbors(node)])
-        adj_str_parts.append("_".join(map(str, neighbors)))
-
-    return f"{n}|{'|'.join(adj_str_parts)}|{triple_bond_edges}"
-
 if __name__ == '__main__':
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -209,44 +187,36 @@ class AlkyneIsomerGenerator:
         return G
 
     def _deduplicate_isomers(self, candidates: List[nx.Graph]) -> List[nx.Graph]:
-        """使用图同构对候选结构进行去重"""
-        unique_graphs = []
-        seen_signatures = set()
-        
+        """两阶段去重：WL哈希分桶 + 桶内精确同构检查"""
+        hash_groups: Dict[str, List[nx.Graph]] = {}
         for G in candidates:
-            # 获取快速签名
-            sig = get_alkyne_graph_signature(G)
-            if sig in seen_signatures:
-                continue
-            
-            # 检查是否与已有图同构
-            is_duplicate = False
-            for existing in unique_graphs:
-                if self._is_isomorphic(G, existing):
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                unique_graphs.append(G)
-                seen_signatures.add(sig)
-        
-        return unique_graphs
-
-    def _is_isomorphic(self, G1: nx.Graph, G2: nx.Graph) -> bool:
-        """检查两个图是否同构（考虑三键）"""
-        def custom_edge_match(e1, e2):
-            return e1.get('bond_type') == e2.get('bond_type')
-        
-        try:
-            gm = nx.isomorphism.GraphMatcher(
-                G1,
-                G2,
-                node_match=nx.isomorphism.categorical_node_match('label', 'C'),
-                edge_match=custom_edge_match
+            h = nx.weisfeiler_lehman_graph_hash(
+                G, edge_attr='bond_type', node_attr='label'
             )
-            return gm.is_isomorphic()
-        except:
-            return False
+            if h not in hash_groups:
+                hash_groups[h] = [G]
+            else:
+                is_dup = False
+                for existing in hash_groups[h]:
+                    if self._is_isomorphic(G, existing):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    hash_groups[h].append(G)
+
+        result = []
+        for group in hash_groups.values():
+            result.extend(group)
+        return result
+
+    @staticmethod
+    def _is_isomorphic(G1: nx.Graph, G2: nx.Graph) -> bool:
+        """检查两个图是否同构（考虑键类型和原子标签）"""
+        return nx.is_isomorphic(
+            G1, G2,
+            node_match=lambda n1, n2: n1.get('label') == n2.get('label'),
+            edge_match=lambda e1, e2: e1.get('bond_type') == e2.get('bond_type')
+        )
 
     def get_isomer_name(self, n: int, index: int, triple_edge: Tuple[int, int] = None) -> str:
         """
