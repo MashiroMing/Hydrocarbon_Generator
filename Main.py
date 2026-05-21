@@ -47,6 +47,7 @@ from utils import (
     GeneratorManager,
     parse_molecule_input,
     compute_formula,
+    format_formula,
     MOL_NAMES_CN,
     MOL_NAMES_FILTER,
     MOL_NAMES_EN,
@@ -779,7 +780,7 @@ class MoleculeApp:
         
         # 从分子式提取氢原子数（供 polyene 推导双键数用）
         import re
-        match = re.match(r'^C(\d+)H(\d+)$', formula_str, re.IGNORECASE)
+        match = re.match(r'^C(\d*)H(\d+)$', formula_str, re.IGNORECASE)
         self._current_n_hydrogen = int(match.group(2)) if match else None
         
         # 确定要生成的分子类型
@@ -2801,7 +2802,7 @@ class MoleculeApp:
                 self._visualize_cycloalkene(isomer, f"C{n_carbon} 单环烯烃 #{idx+1}")
             elif isomer_mol_type == 'alkenyl':
                 # 烯炔烃：使用烯炔烃生成器的可视化方法
-                self._visualize_alkenyl(isomer, f"C{n_carbon}H{2*n_carbon-4} 烯炔烃 #{idx+1}")
+                self._visualize_alkenyl(isomer, f"{format_formula(n_carbon, 2*n_carbon-4)} 烯炔烃 #{idx+1}")
             elif isomer_mol_type in ('triene', 'tetraene', 'polyene'):
                 # 多烯烃：使用多烯烃可视化方法（基于RDKit，含双键标记）
                 mol_name = self._get_mol_display_name(isomer_mol_type, n_carbon)
@@ -2809,16 +2810,16 @@ class MoleculeApp:
             elif isomer_mol_type == 'cyclopolyene':
                 # 单环多烯烃：使用单环多烯烃可视化方法（含双键标记+环标记）
                 desc = self.cyclopolyene_generator.describe_isomer(isomer)
-                formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
+                formula = format_formula(n_carbon, self._current_n_hydrogen) if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else (f"CH?" if n_carbon == 1 else f"C{n_carbon}H?")
                 self._visualize_cyclopolyene(isomer, f"{formula} 单环多烯烃 #{idx+1} ({desc})")
             elif isomer_mol_type == 'multcycloalkane':
                 # 多环烷烃：使用多环烷烃可视化方法
                 desc = self.multcycloalkane_generator.describe_isomer(isomer)
-                formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
+                formula = format_formula(n_carbon, self._current_n_hydrogen) if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else (f"CH?" if n_carbon == 1 else f"C{n_carbon}H?")
                 self._visualize_multcycloalkane(isomer, f"{formula} 多环烷烃 #{idx+1} ({desc})")
             elif isomer_mol_type == 'multcyclomultalkane':
                 # 多环多烯炔烃：使用统一生成器的可视化方法
-                formula = f"C{n_carbon}H{self._current_n_hydrogen}" if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else f"C{n_carbon}H?"
+                formula = format_formula(n_carbon, self._current_n_hydrogen) if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else (f"CH?" if n_carbon == 1 else f"C{n_carbon}H?")
                 desc = self.unified_generator.describe_isomer(isomer)
                 self.unified_generator.visualize_isomer(isomer, title=f"{formula} 多环多烯炔烃 #{idx+1} ({desc})")
         except tk.TclError:

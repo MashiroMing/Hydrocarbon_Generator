@@ -112,12 +112,12 @@ def parse_molecule_input(formula_str):
     if not formula_str:
         return None, None, None, "请输入分子式"
 
-    pattern = r'^C(\d+)H(\d+)$'
+    pattern = r'^C(\d*)H(\d+)$'
     match = re.match(pattern, formula_str, re.IGNORECASE)
     if not match:
         return None, None, None, "分子式格式不正确，请使用如 C5H12、C4H8 的格式"
 
-    n = int(match.group(1))
+    n = int(match.group(1)) if match.group(1) else 1
     m = int(match.group(2))
 
     if n < 1:
@@ -181,25 +181,32 @@ def parse_molecule_input(formula_str):
     return mol_types, n, m, None
 
 
+def format_formula(n_carbon, n_hydrogen):
+    """格式化分子式为标准化学写法：单碳时省略 1，如 CH4 而非 C1H4"""
+    if n_carbon == 1:
+        return f"CH{n_hydrogen}"
+    return f"C{n_carbon}H{n_hydrogen}"
+
+
 def compute_formula(mol_type, n_carbon, n_hydrogen=None):
     """根据分子类型和碳原子数计算分子式"""
     formula_map = {
-        'alkane':      lambda n, m: f"C{n}H{2*n + 2}",
-        'alkene':      lambda n, m: f"C{n}H{2*n}",
-        'alkyne':      lambda n, m: f"C{n}H{2*n - 2}",
-        'diene':       lambda n, m: f"C{n}H{2*n - 2}",
-        'cycloalkane': lambda n, m: f"C{n}H{2*n}",
-        'cycloalkene': lambda n, m: f"C{n}H{2*n - 2}",
-        'alkenyl':     lambda n, m: f"C{n}H{2*n - 4}",
-        'triene':      lambda n, m: f"C{n}H{2*n - 4}",
-        'tetraene':    lambda n, m: f"C{n}H{2*n - 6}",
+        'alkane':      lambda n, m: format_formula(n, 2*n + 2),
+        'alkene':      lambda n, m: format_formula(n, 2*n),
+        'alkyne':      lambda n, m: format_formula(n, 2*n - 2),
+        'diene':       lambda n, m: format_formula(n, 2*n - 2),
+        'cycloalkane': lambda n, m: format_formula(n, 2*n),
+        'cycloalkene': lambda n, m: format_formula(n, 2*n - 2),
+        'alkenyl':     lambda n, m: format_formula(n, 2*n - 4),
+        'triene':      lambda n, m: format_formula(n, 2*n - 4),
+        'tetraene':    lambda n, m: format_formula(n, 2*n - 6),
     }
     if mol_type in formula_map:
         return formula_map[mol_type](n_carbon, n_hydrogen)
     # polyene / cyclopolyene / multcycloalkane / multcyclomultalkane 需要实际氢数
     if n_hydrogen is not None:
-        return f"C{n_carbon}H{n_hydrogen}"
-    return f"C{n_carbon}H?"
+        return format_formula(n_carbon, n_hydrogen)
+    return f"{'CH' if n_carbon == 1 else f'C{n_carbon}H'}?"
 
 
 class GeneratorManager:
@@ -394,9 +401,72 @@ def canon_str_to_graph(canon_str, mol_type, gen_mgr=None):
 
         G = nx.Graph()
         for node, neighbors in adj.items():
+            G.add_node(node, label='C')  # 显式添加节点（处理孤立碳，如甲烷）
             for neighbor in neighbors:
-                G.add_edge(node, neighbor)
+                G.add_edge(node, neighbor, bond_type='single')
         return G
+    except Exception:
+        return None
+
+
+def _render_methane_label(img_size=(400, 300)):
+    """为甲烷 (CH4) 绘制分子结构示意图
+
+    甲烷是单碳四面体分子，中心碳连接四个氢原子。
+    以2D平面投影绘制：C在中心，四个H通过单键连接呈十字形分布。
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        w_inch = img_size[0] / 120.0
+        h_inch = img_size[1] / 120.0
+        fig, ax = plt.subplots(figsize=(w_inch, h_inch), facecolor='white')
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        # 中心碳原子位置
+        cx, cy = 0.5, 0.5
+        # 四个氢原子位置（上下左右，模拟四面体投影）
+        bond_len = 0.25
+        h_positions = [
+            (cx, cy + bond_len),      # 上
+            (cx, cy - bond_len),      # 下
+            (cx - bond_len * 0.9, cy), # 左（稍短，透视效果）
+            (cx + bond_len * 0.9, cy), # 右
+        ]
+
+        # 绘制 C-H 键
+        for hx, hy in h_positions:
+            ax.plot([cx, hx], [cy, hy], 'k-', linewidth=3.0, solid_capstyle='round')
+
+        # 绘制中心碳原子（黑色圆点）
+        ax.plot(cx, cy, 'ko', markersize=22, markerfacecolor='#333333',
+                markeredgecolor='black', markeredgewidth=1.5, zorder=3)
+        # 碳原子标签
+        ax.text(cx, cy, "C", fontsize=14, ha='center', va='center',
+                color='white', weight='bold', zorder=4)
+
+        # 绘制四个氢原子（浅灰圆点）
+        for hx, hy in h_positions:
+            ax.plot(hx, hy, 'o', markersize=16, markerfacecolor='#e0e0e0',
+                    markeredgecolor='#666666', markeredgewidth=1.2, zorder=3)
+            ax.text(hx, hy, "H", fontsize=10, ha='center', va='center',
+                    color='#333333', weight='bold', zorder=4)
+
+        # 设置显示范围
+        margin = 0.1
+        ax.set_xlim(0.5 - bond_len - margin, 0.5 + bond_len + margin)
+        ax.set_ylim(0.5 - bond_len - margin, 0.5 + bond_len + margin)
+
+        fig.tight_layout(pad=0.1)
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120, bbox_inches='tight',
+                    facecolor='white', pad_inches=0.15)
+        plt.close(fig)
+        return buf.getvalue()
     except Exception:
         return None
 
@@ -434,6 +504,11 @@ def render_skeletal_formula(isomer_data, mol_type, gen_mgr=None, img_size=(400, 
             return None
     else:
         return None
+
+    # 1a. 特殊处理：甲烷 (CH4) — 单碳无键，键线式无骨架可绘
+    #     单独绘制 "CH₄" 标签以区别于空白图像
+    if G.number_of_nodes() == 1 and G.number_of_edges() == 0:
+        return _render_methane_label(img_size)
 
     # 2. 转换为 RDKit Mol 并生成 2D 坐标
     mol = graph_to_rdkit_mol(G)

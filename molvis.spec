@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Windows 平台目录模式打包
+# Windows 平台目录模式打包（精简版，干净 venv 专用）
 # 使用方法: pyinstaller molvis.spec
 
 import os
@@ -8,107 +8,40 @@ import sys
 block_cipher = None
 root_dir = os.path.dirname(SPEC)
 
+# 排除 original_programs 下的非代码目录
+_exclude_dirs = ['.codebuddy', '__pycache__', '.git']
+
 a = Analysis(
     ['Main.py'],
     pathex=[root_dir],
     binaries=[],
     datas=[
-        # 项目自身模块（目录模式确保源码被完整收集）
         ('original_programs', 'original_programs'),
         ('utils.py', '.'),
     ],
     hiddenimports=[
-        # ---- 第三方核心库 ----
-        # RDKit
+        # RDKit（pip 版 rdkit 需显式声明子模块）
         'rdkit',
         'rdkit.Chem',
         'rdkit.Chem.AllChem',
         'rdkit.Chem.BondType',
         'rdkit.RDLogger',
-        'rdkit.Geometry',
         'rdkit.Chem.Draw',
-        'rdkit.Chem.rdChemReactions',
         'rdkit.Chem.Draw.rdMolDraw2D',
-        'rdkit.DataStructs',
-        'rdkit.Chem.rdmolfiles',
-        # NumPy
+        # NumPy（PyInstaller hook 自动处理大部分，仅需核心声明）
         'numpy',
-        'numpy._core',
-        'numpy._core._exceptions',
-        'numpy._core._methods',
-        'numpy._core._dtype',
-        'numpy._core._dtype_ctypes',
-        'numpy._core._internal',
-        'numpy._core._add_newdocs',
-        'numpy._core._add_newdocs_scalars',
-        'numpy._core._asarray',
-        'numpy._core._machar',
-        'numpy._core._operand_flag_tests',
-        'numpy._core._rational_tests',
-        'numpy._core._simd',
-        'numpy._core._string_helpers',
-        'numpy._core._struct_ufunc_tests',
-        'numpy._core._type_aliases',
-        'numpy._core._ufunc_config',
-        'numpy._core._umath_tests',
-        'numpy._core.arrayprint',
-        'numpy._core.cversions',
-        'numpy._core.defchararray',
-        'numpy._core.einsumfunc',
-        'numpy._core.fromnumeric',
-        'numpy._core.function_base',
-        'numpy._core.getlimits',
-        'numpy._core.memmap',
-        'numpy._core.multiarray',
-        'numpy._core.numeric',
-        'numpy._core.numerictypes',
-        'numpy._core.overrides',
-        'numpy._core.printoptions',
-        'numpy._core.records',
-        'numpy._core.shape_base',
-        'numpy._core.strings',
-        'numpy._core.umath',
-        'numpy._pyinstaller',
-        'numpy._typing',
-        'numpy._utils',
-        'numpy.compat',
-        'numpy.core',
-        'numpy.fft',
-        'numpy.lib',
-        'numpy.linalg',
-        'numpy.ma',
-        'numpy.matrixlib',
-        'numpy.polynomial',
-        'numpy.random',
-        'numpy.rec',
-        'numpy.strings',
-        'numpy.typing',
         # NetworkX
         'networkx',
-        # Matplotlib
+        # Matplotlib（TkAgg 后端）
         'matplotlib',
-        'matplotlib.pyplot',
-        'matplotlib.backends',
-        'matplotlib.backends.backend_qt5agg',
         'matplotlib.backends.backend_tkagg',
-        'matplotlib.backend_bases',
-        'matplotlib.gridspec',
-        'matplotlib.cm',
-        'mpl_toolkits',
         'mpl_toolkits.mplot3d',
-        # PyQt5
-        'PyQt5',
-        'PyQt5.QtCore',
-        'PyQt5.QtGui',
-        'PyQt5.QtWidgets',
-        'PyQt5.sip',
-        # PIL / CairoSVG
+        # PIL / CairoSVG（键线式渲染）
         'PIL',
         'PIL.Image',
         'PIL.ImageTk',
         'cairosvg',
-        # ---- 项目模块 ----
-        'original_programs',
+        # 项目模块
         'original_programs.alkane_isomer_visualizer',
         'original_programs.alkene_visualizer',
         'original_programs.alkene',
@@ -121,27 +54,29 @@ a = Analysis(
         'original_programs.cyclopolyene_generator',
         'original_programs.polyalkenyne',
         'utils',
-        # ---- 标准库 ----
+        # 多进程（并行加速）
         'multiprocessing',
         'concurrent.futures',
-        'itertools',
-        'functools',
-        'signal',
-        'traceback',
-        'warnings',
-        'collections',
-        'collections.defaultdict',
-        'typing',
-        'datetime',
-        'pickle',
     ],
     hookspath=[],
     runtime_hooks=[os.path.join(root_dir, 'runtime_hook.py')],
     excludes=[
-        'test', 'pytest', 'IPython', 'notebook', 'jupyter', 'sphinx', 'docutils',
-        'PySide6', 'PyQt6', 'PySide2',
-        'qtpy', 'zmq', 'sqlalchemy', 'tables', 'lxml',
-        'MAYGEN', 'MolGen',
+        # 不属于项目的 GUI 框架
+        'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'qtpy',
+        # 科学计算 / 数据科学生态（干净 venv 中不存在，安全排除）
+        'pandas', 'scipy', 'sympy', 'sklearn', 'skimage',
+        'statsmodels', 'astropy', 'xarray', 'numba', 'llvmlite',
+        'dask', 'distributed', 'pyarrow', 'numexpr', 'bottleneck',
+        # 交互式可视化
+        'bokeh', 'panel', 'holoviews', 'plotly', 'altair',
+        'seaborn', 'plotnine',
+        # Web / Jupyter
+        'flask', 'aiohttp', 'werkzeug', 'jupyter', 'ipykernel',
+        'notebook', 'ipywidgets', 'tornado',
+        # 杂项
+        'sqlalchemy', 'h5py', 'conda', 'anaconda',
+        'sphinx', 'pytest', 'test', 'docutils',
+        'MAYGEN', 'MolGen', 'PMG',
     ],
 )
 
