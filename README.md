@@ -76,7 +76,7 @@
 1. 克隆仓库：
 
 ```bash
-git clone https://github.com/MashiroMing/molvis.git
+git clone https://github.com/MashiroMing/Hydrocarbon_Generator.git
 cd molvis
 ```
 
@@ -108,16 +108,16 @@ python Main.py
 **Windows：**
 
 ```bash
-pyinstaller molvis.spec
+pyinstaller Hydrocarbon_Generator.spec
 ```
 
 **Linux：**
 
 ```bash
-pyinstaller molvis_linux.spec
+pyinstaller Hydrocarbon_Generator_linux.spec
 ```
 
-打包产物均位于 `dist/molvis/` 目录下。
+打包产物均位于 `dist/Hydrocarbon_Generator/` 目录下。
 
 ### 自定义打包配置
 
@@ -125,7 +125,7 @@ pyinstaller molvis_linux.spec
 
 | 配置项 | 所在文件 | 说明 |
 |---|---|---|
-| `name` | `EXE()` 中的 `name='molvis'` | 可执行文件名称 |
+| `name` | `EXE()` 中的 `name='Hydrocarbon_Generator'` | 可执行文件名称 |
 | `icon` | `EXE()` 中的 `icon=os.path.join(root_dir, 'icon.ico')` | 应用图标路径 |
 | `console` | `EXE()` 中的 `console=True` | 设为 `False` 可隐藏控制台窗口 |
 | `datas` | `Analysis()` 中 | 需要打包的额外数据文件/目录 |
@@ -139,13 +139,13 @@ pyinstaller molvis_linux.spec
 **Windows：**
 
 ```bash
-dist\molvis\molvis.exe
+dist\Hydrocarbon_Generator\Hydrocarbon_Generator.exe
 ```
 
 **Linux：**
 
 ```bash
-./dist/molvis/molvis
+./dist/Hydrocarbon_Generator/Hydrocarbon_Generator
 ```
 
 > **Linux 用户注意**：如果中文显示为方框，请安装中文字体：
