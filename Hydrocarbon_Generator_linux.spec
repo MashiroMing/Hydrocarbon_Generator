@@ -97,6 +97,7 @@ a = Analysis(
         'original_programs.multcycloalkane',
         'original_programs.cycloalkene_generator',
         'original_programs.cyclopolyene_generator',
+        'molecular_constants',
         # tkinter
         'tkinter',
         'tkinter.filedialog',

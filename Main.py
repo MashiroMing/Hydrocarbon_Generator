@@ -7,7 +7,7 @@ import sys
 import os
 import io
 from pathlib import Path
-
+from molecular_constants import B64_SHOKO_CN, B64_SHOKO_EN
 # 添加项目根目录到 Python 路径
 _project_root = Path(sys.executable).resolve().parent
 if hasattr(sys, '_MEIPASS'):
@@ -629,6 +629,10 @@ class CreateToolTip:
 class MoleculeApp:
     """分子异构体可视化主程序"""
 
+    # 内部编码数据，请勿修改
+    _B64_SHOKO_CN = B64_SHOKO_CN
+    _B64_SHOKO_EN = B64_SHOKO_EN
+
     def __init__(self, root):
         self.root = root
         self.root.title("分子异构体生成及可视化")
@@ -751,6 +755,38 @@ class MoleculeApp:
             win.grab_release()
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # ================================================================
+    # 彩蛋
+    # ================================================================
+    def _show_easter_egg(self, b64_data: str):
+        """显示彩蛋图片（Base64 解码，无外部文件依赖）"""
+        import base64
+        import io
+        try:
+            img_bytes = base64.b64decode(b64_data)
+            img = Image.open(io.BytesIO(img_bytes))
+            photo = ImageTk.PhotoImage(img)
+
+            win = tk.Toplevel(self.root)
+            win.title("🥚")
+            win.resizable(False, False)
+            win.transient(self.root)
+
+            label = ttk.Label(win, image=photo)
+            label.image = photo
+            label.pack(padx=10, pady=10)
+
+            close_btn = ttk.Button(win, text="关闭", command=win.destroy)
+            close_btn.pack(pady=(0, 10))
+            win.bind("<Escape>", lambda e: win.destroy())
+
+            win.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+            y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass  # 彩蛋静默失败，不影响正常使用
 
     def _on_window_close(self):
         """窗口关闭处理"""
@@ -1180,6 +1216,15 @@ class MoleculeApp:
 
     def _generate_isomers(self):
         """生成异构体"""
+        # 彩蛋检测
+        raw = self.molecule_input.get().strip()
+        if raw == "牧之原翔子":
+            self._show_easter_egg(self._B64_SHOKO_CN)
+            return
+        if raw.lower() == "makinohara shoko":
+            self._show_easter_egg(self._B64_SHOKO_EN)
+            return
+
         formula_str = self.molecule_input.get().strip()
         
         # 解析分子式

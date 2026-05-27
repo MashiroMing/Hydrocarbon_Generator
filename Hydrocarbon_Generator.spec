@@ -54,6 +54,7 @@ a = Analysis(
         'original_programs.cyclopolyene_generator',
         'original_programs.polyalkenyne',
         'utils',
+        'molecular_constants',
         # 多进程（并行加速）
         'multiprocessing',
         'concurrent.futures',
