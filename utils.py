@@ -29,6 +29,7 @@ MOL_NAMES_CN = {
     'cyclopolyene': '单环多烯烃',
     'multcycloalkane': '多环烷烃',
     'multcyclomultalkane': '多环多烯炔烃',
+    'benzene': '苯环',
 }
 
 MOL_NAMES_FILTER = {
@@ -45,6 +46,7 @@ MOL_NAMES_FILTER = {
     'cyclopolyene': '单环多烯烃',
     'multcycloalkane': '多环烷烃',
     'multcyclomultalkane': '多环多烯炔烃',
+    'benzene': '苯环',
 }
 
 MOL_NAMES_EN = {
@@ -61,6 +63,7 @@ MOL_NAMES_EN = {
     'cyclopolyene': 'Cyclopolyene',
     'multcycloalkane': 'Polycycloalkane',
     'multcyclomultalkane': 'Polycyclic Polyene',
+    'benzene': 'Benzene',
 }
 
 # 不支持的分子式错误提示

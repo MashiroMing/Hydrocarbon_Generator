@@ -130,7 +130,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='molvis',
+    name='Hydrocarbon_Generator',
     debug=False,
     strip=False,
     upx=True,
@@ -145,5 +145,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='molvis',
+    name='Hydrocarbon_Generator',
 )

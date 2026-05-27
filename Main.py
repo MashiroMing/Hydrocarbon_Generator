@@ -1,5 +1,5 @@
 """
-分子异构体生成及可视化 - 主界面
+生成并可视化烃类的同分异构体 - 主界面
 统一管理烷烃、烯烃、二烯烃、环烷烃的异构体生成与可视化
 """
 
@@ -106,9 +106,103 @@ def _parallel_compute_coords(args):
         return idx, {}, []
 
 
+# ============================================================
+# C-C 键长松弛：修复 RDKit 嵌入产生的异常键长（>1.7 Å 或 <1.3 Å）
+# ============================================================
+def _relax_bond_lengths(G, c_coords, h_coords, n_carbons,
+                        target=1.54, tol=0.08, max_iters=200):
+    """对异常 C-C 键长进行弹簧力迭代松弛
+
+    Args:
+        G: 分子图
+        c_coords: {node_id: (x,y,z)}
+        h_coords: [(x,y,z), ...]
+        n_carbons: 碳原子数
+        target: 目标 C-C 键长 (Å)
+        tol: 容差，键长超出 target±tol 时触发松弛
+        max_iters: 最大迭代次数
+
+    Returns:
+        (c_coords, h_coords)
+    """
+    import numpy as np
+
+    c_arr = np.zeros((n_carbons, 3))
+    for i in range(n_carbons):
+        if i in c_coords:
+            c_arr[i] = c_coords[i]
+
+    h_list = [list(h) for h in h_coords]
+
+    for iteration in range(max_iters):
+        # 查找异常边
+        bad_edges = []
+        for u, v in G.edges():
+            if u >= n_carbons or v >= n_carbons:
+                continue
+            d = np.linalg.norm(c_arr[u] - c_arr[v])
+            if d > target + tol or d < target - tol:
+                bad_edges.append((u, v, d))
+
+        if not bad_edges:
+            break
+
+        # 弹簧力：方向 from u to v，大小正比于 (d - target)
+        # 力常数随迭代衰减
+        k = max(0.1, 1.0 - iteration / max_iters * 0.9)
+        forces = np.zeros((n_carbons, 3))
+
+        for u, v, d in bad_edges:
+            direction = c_arr[v] - c_arr[u]
+            if d < 1e-8:
+                direction = np.random.randn(3) * 0.01
+                d = 1e-8
+            force = direction / d * (d - target) * k * 0.5
+            forces[u] += force
+            forces[v] -= force
+
+        # 更新碳坐标
+        for i in range(n_carbons):
+            if i in c_coords:
+                c_arr[i] += forces[i]
+
+    # 更新氢坐标（跟随最近碳移动）
+    h_result = []
+    for h_pos in h_list:
+        h_arr = np.array(h_pos)
+        # 找最近碳
+        min_d = float('inf')
+        nearest = 0
+        for ci in range(n_carbons):
+            if ci in c_coords:
+                d = np.linalg.norm(h_arr - c_arr[ci])
+                if d < min_d:
+                    min_d = d
+                    nearest = ci
+        # 保持 C-H 键长 1.09 Å
+        vec = h_arr - c_arr[nearest]
+        dist = np.linalg.norm(vec)
+        if dist > 1e-8:
+            h_arr = c_arr[nearest] + vec / dist * 1.09
+        h_result.append(tuple(float(x) for x in h_arr))
+
+    # 还原 c_coords 字典
+    c_result = {}
+    for i in range(n_carbons):
+        if i in c_coords:
+            c_result[i] = (float(c_arr[i, 0]), float(c_arr[i, 1]), float(c_arr[i, 2]))
+
+    return c_result, h_result
+
+
 def _rdkit_coords_single(G):
-    """RDKit构建全单键分子并生成3D坐标"""
+    """RDKit构建全单键分子并生成3D坐标
+
+    对大分子（≥13碳）使用多种子策略，选择最大C-C键长最短的构象，
+    避免单种子陷入局部最小值导致的断键（C-C > 1.7 Å 被 GaussView 判定为断键）。
+    """
     import networkx as nx
+    import math
     from rdkit import Chem
     from rdkit.Chem import AllChem, BondType
     from rdkit import RDLogger
@@ -129,10 +223,54 @@ def _rdkit_coords_single(G):
     mol = mol.GetMol()
     Chem.SanitizeMol(mol)
     mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, randomSeed=42)
-    AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
 
-    return _extract_coords(mol)
+    # 大分子（≥13碳）或高分支：多种子策略
+    if n_carbons >= 13:
+        best_mol = None
+        best_max_bond = float('inf')
+        n_seeds = min(30, max(10, n_carbons))  # 随碳数增加种子数
+        for seed in range(n_seeds):
+            mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+            params = AllChem.ETKDGv3()
+            params.randomSeed = seed
+            res = AllChem.EmbedMolecule(mol_trial, params)
+            if res == -1:
+                res = AllChem.EmbedMolecule(mol_trial, randomSeed=seed,
+                                            useRandomCoords=True)
+                if res == -1:
+                    continue
+            try:
+                AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+            except Exception:
+                pass
+            conf = mol_trial.GetConformer()
+            max_bond = 0.0
+            for u, v in G.edges():
+                p1 = conf.GetAtomPosition(u)
+                p2 = conf.GetAtomPosition(v)
+                d = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2
+                              + (p1.z - p2.z) ** 2)
+                max_bond = max(max_bond, d)
+            if max_bond < best_max_bond:
+                best_max_bond = max_bond
+                best_mol = Chem.Mol(mol_trial.ToBinary())
+        if best_mol is not None:
+            mol = best_mol
+        else:
+            # 所有种子都失败，回退单种子
+            AllChem.EmbedMolecule(mol, randomSeed=42)
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    else:
+        # 小分子：单种子即可
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+
+    c_coords, h_coords = _extract_coords(mol)
+    # 键长松弛：修复 RDKit 产生的异常 C-C 键长
+    if c_coords:
+        c_coords, h_coords = _relax_bond_lengths(
+            G, c_coords, h_coords, n_carbons)
+    return c_coords, h_coords
 
 
 def _rdkit_coords_with_bonds(G, double_only=True):
@@ -236,22 +374,59 @@ def _rdkit_coords_with_bonds(G, double_only=True):
             # 所有种子都失败，回退到2D坐标
             AllChem.Compute2DCoords(mol)
     else:
-        # 非环分子：使用单种子3D嵌入
-        embed_ok = False
-        result = AllChem.EmbedMolecule(mol, randomSeed=42)
-        if result != -1:
-            embed_ok = True
-        else:
-            result2 = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
-            if result2 != -1:
-                embed_ok = True
-        if not embed_ok:
-            AllChem.Compute2DCoords(mol)
-        else:
-            try:
+        # 非环分子：大分子使用多种子策略，避免局部最小值导致的断键
+        if n_carbons >= 13:
+            best_mol = None
+            best_max_bond = float('inf')
+            n_seeds = min(30, max(10, n_carbons))
+            for seed in range(n_seeds):
+                mol_trial = Chem.RWMol(Chem.Mol(mol.ToBinary()))
+                params = AllChem.ETKDGv3()
+                params.randomSeed = seed
+                res = AllChem.EmbedMolecule(mol_trial, params)
+                if res == -1:
+                    res = AllChem.EmbedMolecule(mol_trial, randomSeed=seed,
+                                                useRandomCoords=True)
+                    if res == -1:
+                        continue
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol_trial, maxIters=500)
+                except Exception:
+                    pass
+                conf = mol_trial.GetConformer()
+                max_bond = 0.0
+                for u, v in G.edges():
+                    if u < n_carbons and v < n_carbons:
+                        p1 = conf.GetAtomPosition(u)
+                        p2 = conf.GetAtomPosition(v)
+                        d = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2
+                                      + (p1.z - p2.z) ** 2)
+                        max_bond = max(max_bond, d)
+                if max_bond < best_max_bond:
+                    best_max_bond = max_bond
+                    best_mol = Chem.Mol(mol_trial.ToBinary())
+            if best_mol is not None:
+                mol = best_mol
+            else:
+                AllChem.EmbedMolecule(mol, randomSeed=42)
                 AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
-            except Exception:
-                pass
+        else:
+            # 小分子：单种子3D嵌入
+            embed_ok = False
+            result = AllChem.EmbedMolecule(mol, randomSeed=42)
+            if result != -1:
+                embed_ok = True
+            else:
+                result2 = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
+                if result2 != -1:
+                    embed_ok = True
+            if not embed_ok:
+                AllChem.Compute2DCoords(mol)
+            else:
+                try:
+                    AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+                except Exception:
+                    pass
 
     c_coords, h_coords = _extract_coords(mol)
 
@@ -263,6 +438,11 @@ def _rdkit_coords_with_bonds(G, double_only=True):
     # 修正累积双键段(C=C=C)的共线问题
     if double_bonds:
         c_coords = _fix_cumulated_diene_coords_standalone(G, c_coords)
+
+    # 键长松弛：修复 RDKit 产生的异常 C-C 键长
+    if c_coords:
+        c_coords, h_coords = _relax_bond_lengths(
+            G, c_coords, h_coords, n_carbons)
 
     return c_coords, h_coords
 
@@ -415,6 +595,37 @@ def _fix_cumulated_diene_coords_standalone(G, c_coords):
     return c_coords
 
 
+# ============================================================
+# Tooltip：悬停提示小窗口
+# ============================================================
+class CreateToolTip:
+    """为 tkinter 控件添加鼠标悬停提示"""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip_window = None
+        widget.bind('<Enter>', self._show)
+        widget.bind('<Leave>', self._hide)
+
+    def _show(self, event=None):
+        if self.tip_window:
+            return
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, background="#ffffcc",
+                         foreground="#333333", font=('Microsoft YaHei', 10),
+                         relief=tk.SOLID, borderwidth=1, padx=6, pady=2)
+        label.pack()
+
+    def _hide(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+
 class MoleculeApp:
     """分子异构体可视化主程序"""
 
@@ -447,6 +658,100 @@ class MoleculeApp:
         # 配置样式
         self._configure_styles()
 
+    def _show_usage(self):
+        """弹窗显示使用说明"""
+        win = tk.Toplevel(self.root)
+        win.title("使用说明")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        # 内容框架
+        frame = ttk.Frame(win, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # 标题
+        ttk.Label(frame, text="使用说明",
+                  font=('Microsoft YaHei', 14, 'bold'),
+                  foreground='#1a3a5c').pack(anchor=tk.W, pady=(0, 5))
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 10))
+
+        # 正文（固定宽度，自动换行）
+        usage_lines = [
+            ("bold", "1.  整体功能说明："),
+            ("normal", "本工具用于生成烃类异构体并进行 3D 交互可视化。"),
+            ("", ""),
+            ("bold", "2.  使用方法"),
+            ("bold", "2.1  输入分子式"),
+            ("normal", '在\u201c分子式\u201d输入框中键入任意碳氢化合物的分子式（如CH4、C5H12、C4H8、C6H6，不区分大小写）'),
+            ("bold", "2.2  选择类型"),
+            ("normal", '选择\u201c全部\u201d或指定单一类别'),
+            ("bold", "2.3  生成异构体"),
+            ("normal", "点击【生成异构体】按钮，程序将枚举所有符合化学约束的结构，并显示在列表中"),
+            ("bold", "2.4  查看结构"),
+            ("normal", "单击列表中的某个异构体，右侧会展示其键线式（2D 结构图）信息"),
+            ("bold", "2.5  可视化当前选中异构体"),
+            ("normal", "点击【可视化当前分子】按钮，即可在新窗口中查看该分子的 3D 交互模型（支持旋转）"),
+            ("bold", "2.6  另存为"),
+            ("normal", "可以将选中的分子导出为 Gaussian 输入文件（.gjf）"),
+            ("bold", "2.7  快捷键与操作技巧"),
+            ("normal", "• Ctrl + 单击 — 多选列表中的异构体"),
+            ("normal", "• Shift + 单击 — 范围选择"),
+            ("normal", '• 右键单击键线式图片 — 弹出菜单，可选择\u201c复制图像\u201d或\u201c另存为...\u201d'),
+            ("", ""),
+            ("bold", "3.  开发者说明和引用说明"),
+            ("normal", "开发者：张曾继明，甘利华"),
+            ("normal", "联系方式：2678605701@qq.com ; ganlh@swu.edu.cn"),
+            ("normal", "技术栈：Python 3.11，Tkinter，RDKit，Py3Dmol"),
+            ("normal", "许可协议：MIT License"),
+            ("normal", "引用说明：若本工具对您的研究或工作有帮助，请引用："),
+            ("normal", "张曾继明，甘利华. (2026). 一个开源烃类异构体生成程序.化学教育"),
+            ("normal", "源代码地址：https://github.com/MashiroMing/molvis"),
+        ]
+
+        for style_tag, line in usage_lines:
+            if not line:
+                # 空行作为间距
+                spacer = ttk.Frame(frame, height=6)
+                spacer.pack(fill=tk.X)
+                continue
+            kwargs = {
+                'text': line,
+                'wraplength': 500,
+                'anchor': tk.W,
+                'justify': tk.LEFT,
+                'font': ('Microsoft YaHei', 11),
+            }
+            if style_tag == "bold":
+                kwargs.update({'font': ('Microsoft YaHei', 11, 'bold'),
+                               'foreground': '#2a2a2a'})
+            ttk.Label(frame, **kwargs).pack(fill=tk.X, pady=1)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 10))
+
+        # 关闭按钮
+        ttk.Button(frame, text="关闭", style='Action.TButton',
+                   command=win.destroy).pack(pady=(0, 5))
+
+        # 居中于主窗口
+        win.update_idletasks()
+        w = win.winfo_width()
+        h = win.winfo_height()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+        win.geometry(f"+{x}+{y}")
+
+        # 关闭时释放 grab
+        def _on_close():
+            win.grab_release()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
     def _on_window_close(self):
         """窗口关闭处理"""
         self.window_closed = True
@@ -463,6 +768,7 @@ class MoleculeApp:
         # 烷烃专用生成器（独立于统一生成器）
         self.alkane_generator = self.gen_mgr.alkane_generator
         self.alkane_visualizer = self.gen_mgr.alkane_visualizer
+        self.alkene_visualizer = self.gen_mgr.alkene_visualizer
         # 统一生成器（所有非烷烃类型）
         self.unified_generator = self.gen_mgr.unified_generator
         self.generators = self.gen_mgr.generators
@@ -479,10 +785,12 @@ class MoleculeApp:
     def _configure_styles(self):
         """配置界面样式"""
         style = ttk.Style()
+        style.configure('TLabel', font=('Microsoft YaHei', 12))
+        style.configure('TLabelframe.Label', font=('Microsoft YaHei', 12))
         style.configure('Title.TLabel', font=('Microsoft YaHei', 14, 'bold'))
-        style.configure('Subtitle.TLabel', font=('Microsoft YaHei', 11))
-        style.configure('Info.TLabel', font=('Microsoft YaHei', 9))
-        style.configure('Action.TButton', font=('Microsoft YaHei', 10), padding=10)
+        style.configure('Subtitle.TLabel', font=('Microsoft YaHei', 12))
+        style.configure('Info.TLabel', font=('Microsoft YaHei', 12))
+        style.configure('Action.TButton', font=('Microsoft YaHei', 12), padding=10)
 
     def _create_widgets(self):
         """创建界面组件"""
@@ -496,17 +804,25 @@ class MoleculeApp:
         title_frame = ttk.Frame(main_frame)
         title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 15))
 
-        ttk.Label(
-            title_frame,
-            text="分子异构体生成及可视化",
-            style='Title.TLabel'
-        ).pack()
+        # 三列布局：左弹性 | 标题居中 | 按钮右对齐
+        title_frame.columnconfigure(0, weight=1)
+        title_frame.columnconfigure(2, weight=1)
 
         ttk.Label(
             title_frame,
             text="生成并可视化烃类的同分异构体",
-            style='Info.TLabel'
-        ).pack()
+            style='Title.TLabel'
+        ).grid(row=0, column=1)
+
+        # 使用说明按钮（右侧）
+        self.help_btn = ttk.Button(
+            title_frame, text="\u2753", width=3,
+            style='Action.TButton',
+            command=self._show_usage
+        )
+        self.help_btn.grid(row=0, column=2, sticky='e', padx=(10, 0))
+        # 悬停提示
+        self._help_tooltip = CreateToolTip(self.help_btn, "使用说明")
 
         # ===== 输入区域 =====
         input_frame = ttk.LabelFrame(main_frame, text="分子输入", padding="10")
@@ -522,10 +838,10 @@ class MoleculeApp:
             formula_frame,
             textvariable=self.molecule_input,
             width=20,
-            font=('Consolas', 11)
+            font=('Times New Roman', 12)
         )
         self.formula_entry.pack(side=tk.LEFT, padx=5)
-        ttk.Label(formula_frame, text='(例: C5H12, C4H8, C3H4, C5H8, C6H12, C4H6, C5H6)', style='Info.TLabel').pack(side=tk.LEFT, padx=5)
+        ttk.Label(formula_frame, text='(例: CH4, C4H8, C5H6, C6H6, C10H20, C15H32)', style='Info.TLabel').pack(side=tk.LEFT, padx=5)
 
         # 识别结果显示行
         self.parsed_info_var = tk.StringVar(value="")
@@ -590,7 +906,7 @@ class MoleculeApp:
         result_frame.grid(row=2, column=0, sticky="nsew", pady=10)
         result_frame.columnconfigure(0, weight=1)
         result_frame.columnconfigure(1, weight=1)
-        result_frame.rowconfigure(0, weight=1, minsize=500)
+        result_frame.rowconfigure(0, weight=1)
 
         # 左侧：异构体列表
         list_frame = ttk.LabelFrame(result_frame, text="异构体列表", padding="5")
@@ -630,8 +946,8 @@ class MoleculeApp:
         self.isomer_listbox = tk.Listbox(
             list_container,
             yscrollcommand=list_scroll.set,
-            font=('Consolas', 10),
-            selectmode=tk.SINGLE
+            font=('Times New Roman', 12),
+            selectmode=tk.EXTENDED
         )
         self.isomer_listbox.grid(row=0, column=0, sticky="nsew")
         self.isomer_listbox.bind('<<ListboxSelect>>', self._on_isomer_selected)
@@ -656,12 +972,21 @@ class MoleculeApp:
         )
         self._formula_canvas.pack(fill=tk.X, pady=(0, 5))
         self._formula_photo = None  # 保持对 PhotoImage 的引用，防止被 GC
+        self._skeletal_png_data = None  # 原始 PNG 字节
+
+        # 右键菜单：复制图像 / 另存为
+        self._canvas_context_menu = tk.Menu(self._formula_canvas, tearoff=0)
+        self._canvas_context_menu.add_command(label="复制图像", command=self._on_copy_skeletal_image)
+        self._canvas_context_menu.add_command(label="另存为...", command=self._on_save_skeletal_image)
+        self._formula_canvas.bind("<Button-3>", self._on_formula_canvas_right_click)
+        # macOS 兼容
+        self._formula_canvas.bind("<Button-2>", self._on_formula_canvas_right_click)
 
         # 文本信息区域
         self.info_text = scrolledtext.ScrolledText(
             info_frame,
             width=40,
-            font=('Microsoft YaHei', 10),
+            font=('Microsoft YaHei', 12),
             wrap=tk.WORD
         )
         self.info_text.pack(fill=tk.BOTH, expand=True)
@@ -719,8 +1044,21 @@ class MoleculeApp:
         for widget in self.type_filter_radio_frame.winfo_children():
             widget.destroy()
         
-        if mol_types and len(mol_types) > 1:
-            # 有同分异构情况，显示筛选
+        # 检查是否需要显示苯环筛选（不饱和度 k ≥ 4）
+        show_benzene = False
+        if mol_types:
+            import re
+            formula_str = self.molecule_input.get().strip()
+            match = re.match(r'^C(\d*)H(\d+)$', formula_str, re.IGNORECASE)
+            if match:
+                n = int(match.group(1)) if match.group(1) else 1
+                m = int(match.group(2))
+                k = (2 * n + 2 - m) // 2
+                if k >= 4:
+                    show_benzene = True
+
+        if (mol_types and len(mol_types) > 1) or show_benzene:
+            # 有同分异构或可选苯环筛选
             self.type_filter_var.set('all')
             
             mol_names = MOL_NAMES_FILTER
@@ -738,6 +1076,15 @@ class MoleculeApp:
                     text=mol_names.get(mt, mt),
                     variable=self.type_filter_var,
                     value=mt
+                ).pack(side=tk.LEFT, padx=8)
+            
+            # 苯环筛选（仅在不饱和度足够时显示）
+            if show_benzene:
+                ttk.Radiobutton(
+                    self.type_filter_radio_frame,
+                    text="含苯环",
+                    variable=self.type_filter_var,
+                    value='benzene'
                 ).pack(side=tk.LEFT, padx=8)
             
             self.type_filter_frame.pack(fill=tk.X, pady=5)
@@ -768,6 +1115,69 @@ class MoleculeApp:
         """碳原子数改变时的处理（已弃用）"""
         pass
 
+    # -----------------------------------------------------------------
+    # 苯环检测
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _has_benzene_ring(G):
+        """检测图中是否包含凯库勒式苯环（6元环，3条双键与3条单键交替排列）
+
+        Args:
+            G: networkx.Graph，边含 bond_type 属性
+
+        Returns:
+            bool: 是否至少含一个凯库勒式苯环
+        """
+        import networkx as nx
+        try:
+            all_cycles = nx.cycle_basis(G)
+        except Exception:
+            return False
+
+        for cycle_nodes in all_cycles:
+            if len(cycle_nodes) != 6:
+                continue
+
+            # 检查这6个节点是否确实构成简单6元环（诱导子图度数为2）
+            sub = G.subgraph(cycle_nodes)
+            if sub.number_of_edges() != 6:
+                continue
+            if not all(d == 2 for _, d in sub.degree()):
+                continue
+
+            # 遍历子图获取环序（nx.find_cycle 返回环序边列表）
+            try:
+                edges_in_order = nx.find_cycle(sub, orientation='ignore')
+            except nx.NetworkXNoCycle:
+                continue
+
+            if len(edges_in_order) != 6:
+                continue
+
+            # 收集按环序排列的键类型
+            bond_types = []
+            for u, v, _ in edges_in_order:
+                bt = sub[u][v].get('bond_type', 'single')
+                if bt == 'triple':
+                    break  # 三键不可能在苯环上
+                bond_types.append(bt)
+            if len(bond_types) != 6:
+                continue
+
+            # 凯库勒式：严格单双交替 [单,双,单,双,单,双] 或 [双,单,双,单,双,单]
+            single = 'single'
+            double = 'double'
+            patterns = [
+                [single, double, single, double, single, double],
+                [double, single, double, single, double, single],
+            ]
+            for pat in patterns:
+                for shift in range(6):
+                    if [bond_types[(shift + i) % 6] for i in range(6)] == pat:
+                        return True
+
+        return False
+
     def _generate_isomers(self):
         """生成异构体"""
         formula_str = self.molecule_input.get().strip()
@@ -785,8 +1195,8 @@ class MoleculeApp:
         
         # 确定要生成的分子类型
         type_filter = self.type_filter_var.get()
-        if type_filter == 'all':
-            # 生成所有匹配类型
+        if type_filter in ('all', 'benzene'):
+            # "全部"或"苯环"：先生成全部，苯环由后置筛选
             target_types = mol_types
         else:
             if type_filter in mol_types:
@@ -843,8 +1253,8 @@ class MoleculeApp:
 
             n_hydrogen = getattr(self, '_current_n_hydrogen', None)
 
-            if type_filter == 'all':
-                # "全部"模式：使用 generate_all 统一生成，避免跨类型重复
+            if type_filter in ('all', 'benzene'):
+                # "全部"或"苯环"：使用 generate_all 统一生成
                 self._update_progress(10, "统一生成异构体...")
                 all_isomers = self.gen_mgr.generate_all(n_carbon, n_hydrogen)
                 # 统计各类型数量
@@ -856,6 +1266,18 @@ class MoleculeApp:
                 type_counts[type_filter] = len(isomers)
                 for iso in isomers:
                     all_isomers.append((type_filter, iso))
+
+            # 苯环后置筛选：从全部异构体中筛选含凯库勒苯环的结构
+            if type_filter == 'benzene':
+                import networkx as nx
+                all_isomers = [
+                    (mt, iso) for mt, iso in all_isomers
+                    if isinstance(iso, nx.Graph) and self._has_benzene_ring(iso)
+                ]
+                type_counts = {}
+                for mol_type, iso in all_isomers:
+                    type_counts.setdefault('benzene', 0)
+                    type_counts['benzene'] += 1
 
             self._update_progress(90, "生成完成")
 
@@ -958,6 +1380,10 @@ class MoleculeApp:
 
             for i, (mol_type, _) in enumerate(all_isomers):
                 self.isomer_listbox.insert(tk.END, f"#{i+1:3d}  {formulas[mol_type]}  {mol_names[mol_type]}")
+
+            # 强制刷新滚动区域（修复非最大化窗口滚动不到底部的问题）
+            self.isomer_listbox.update_idletasks()
+            self.isomer_listbox.yview_moveto(0)
 
             # 计算筛选选项（主链长度/环大小）
             self._update_filter_options([iso for _, iso in all_isomers],
@@ -1183,6 +1609,10 @@ class MoleculeApp:
                 # 更新筛选结果标签
                 filter_name = getattr(self, '_current_filter_label', '主链长度:').replace(':', '')
                 self.filter_result_var.set(f"({filter_name}={target_length}: {filtered_count} 个)")
+            
+            # 强制刷新滚动区域（修复非最大化窗口滚动不到底部的问题）
+            self.isomer_listbox.update_idletasks()
+            self.isomer_listbox.yview_moveto(0)
         
         except Exception as e:
             pass  # 忽略错误
@@ -1273,6 +1703,7 @@ class MoleculeApp:
         # 清除旧图片，释放内存
         self._formula_canvas.delete("all")
         self._formula_photo = None
+        self._skeletal_png_data = None  # 原始 PNG 字节（供右键复制/另存用）
 
         if not HAS_SKELETAL_DRAWING:
             self._show_skeletal_placeholder("键线式渲染不可用\n请安装: pip install cairosvg Pillow")
@@ -1289,6 +1720,9 @@ class MoleculeApp:
                 if png_data is None:
                     self.root.after(0, self._show_skeletal_placeholder, "键线式渲染不可用")
                     return
+
+                # 保存原始 PNG 字节（供右键复制/另存用）
+                self._skeletal_png_data = png_data
 
                 # PNG 字节 → PIL Image（纯内存，无临时文件）
                 from PIL import Image
@@ -1335,6 +1769,59 @@ class MoleculeApp:
         except Exception:
             self._show_skeletal_placeholder("键线式渲染不可用")
 
+    def _on_formula_canvas_right_click(self, event):
+        """右键弹出菜单：复制图像 / 另存为"""
+        if self._skeletal_png_data is not None:
+            try:
+                self._canvas_context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self._canvas_context_menu.grab_release()
+
+    def _on_copy_skeletal_image(self):
+        """将键线式图片复制到剪贴板"""
+        if self._skeletal_png_data is None:
+            return
+        try:
+            from PIL import Image
+            import io as io_pil
+            img = Image.open(io_pil.BytesIO(self._skeletal_png_data))
+
+            # Windows: 通过 Win32 API 复制 PNG 到剪贴板
+            import subprocess
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+            tmp.write(self._skeletal_png_data)
+            tmp.close()
+            # 使用 PowerShell 复制图像到剪贴板
+            subprocess.run([
+                'powershell', '-NoProfile', '-Command',
+                f'Add-Type -AssemblyName System.Windows.Forms;'
+                f'$img = [System.Drawing.Image]::FromFile("{tmp.name}");'
+                f'[System.Windows.Forms.Clipboard]::SetImage($img);'
+                f'$img.Dispose()'
+            ], capture_output=True, timeout=10)
+            import os
+            os.unlink(tmp.name)
+        except Exception:
+            pass  # 复制失败时静默忽略
+
+    def _on_save_skeletal_image(self):
+        """将键线式图片另存为 PNG 文件"""
+        if self._skeletal_png_data is None:
+            return
+        try:
+            import tkinter.filedialog
+            file_path = tkinter.filedialog.asksaveasfilename(
+                title="保存键线式图片",
+                defaultextension=".png",
+                filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")]
+            )
+            if file_path:
+                with open(file_path, 'wb') as f:
+                    f.write(self._skeletal_png_data)
+        except Exception as e:
+            messagebox.showerror("保存失败", f"无法保存图片: {str(e)}")
+
     def _show_skeletal_placeholder(self, message="键线式渲染不可用"):
         """显示键线式占位提示"""
         try:
@@ -1344,7 +1831,7 @@ class MoleculeApp:
             self._formula_canvas.create_text(
                 190, 100,
                 text=message,
-                font=('Microsoft YaHei', 10),
+                font=('Microsoft YaHei', 12),
                 fill='#999999',
                 justify=tk.CENTER
             )
@@ -2716,6 +3203,8 @@ class MoleculeApp:
         而GaussView根据原子间距离判断键级，C-H键的典型值为1.09Å，
         超过~1.2Å就不会显示键连接，因此需要将氢原子位置沿C-H方向缩放到1.09Å。
 
+        若 h_to_c 不存在或某H未映射，自动寻找最近的碳原子作为归属碳。
+
         Args:
             c_coords: 碳原子坐标字典 {node_id: (x, y, z)}
             h_coords: 氢原子坐标列表 [(x, y, z), ...]
@@ -2730,17 +3219,30 @@ class MoleculeApp:
         result_h = list(h_coords)
 
         for h_i in range(len(result_h)):
-            if h_i in h_to_c:
+            h_pos = np.array(result_h[h_i])
+
+            # 确定归属碳：优先使用 h_to_c 映射，否则找最近的碳
+            c_i = None
+            if h_to_c is not None and h_i in h_to_c and h_to_c[h_i] in c_coords:
                 c_i = h_to_c[h_i]
-                if c_i in c_coords:
-                    h_pos = np.array(result_h[h_i])
-                    c_pos = np.array(c_coords[c_i])
-                    vec = h_pos - c_pos
-                    dist = np.linalg.norm(vec)
-                    if dist > 1e-8:
-                        # 沿C-H方向缩放氢原子位置至1.09Å
-                        new_h_pos = c_pos + vec / dist * TARGET_CH
-                        result_h[h_i] = (float(new_h_pos[0]), float(new_h_pos[1]), float(new_h_pos[2]))
+            else:
+                # 回退：找距离最近的碳原子
+                min_dist = float('inf')
+                for c_idx, c_pos_val in c_coords.items():
+                    c_pos_arr = np.array(c_pos_val)
+                    d = np.linalg.norm(h_pos - c_pos_arr)
+                    if d < min_dist:
+                        min_dist = d
+                        c_i = c_idx
+
+            if c_i is not None and c_i in c_coords:
+                c_pos = np.array(c_coords[c_i])
+                vec = h_pos - c_pos
+                dist = np.linalg.norm(vec)
+                if dist > 1e-8:
+                    # 沿C-H方向缩放氢原子位置至1.09Å
+                    new_h_pos = c_pos + vec / dist * TARGET_CH
+                    result_h[h_i] = (float(new_h_pos[0]), float(new_h_pos[1]), float(new_h_pos[2]))
 
         return result_h
 
@@ -2827,14 +3329,33 @@ class MoleculeApp:
         except Exception as e:
             self._show_error(str(e))
 
+    def _get_original_index(self, listbox_index):
+        """从列表项文本中还原异构体的原始索引"""
+        item_text = self.isomer_listbox.get(listbox_index)
+        try:
+            return int(item_text.split('#')[1].split()[0]) - 1
+        except Exception:
+            return listbox_index
+
     def _save_as(self):
-        """另存为 - 保存所有异构体信息"""
+        """另存为 - 保存异构体信息（支持多选导出）"""
         if self.window_closed:
             return
 
         if not self.current_isomers:
             messagebox.showwarning("无异构体", "请先生成异构体")
             return
+
+        # 获取用户选中的列表项索引
+        selected_indices = self.isomer_listbox.curselection()
+        if selected_indices:
+            # 用户有选中 → 仅导出选中的异构体
+            indices = [self._get_original_index(i) for i in selected_indices]
+            label = f"已选中 {len(indices)} 个异构体"
+        else:
+            # 无选中 → 导出全部
+            indices = list(range(len(self.current_isomers)))
+            label = f"共 {len(indices)} 个异构体"
 
         mol_type = self.current_molecule_type
         n_carbon = self.current_carbon_count
@@ -2846,7 +3367,7 @@ class MoleculeApp:
         # 让用户选择保存位置
         import tkinter.filedialog
         folder_path = tkinter.filedialog.askdirectory(
-            title="选择保存文件夹",
+            title=f"选择保存文件夹 — {label}",
             initialdir=str(Path.home())
         )
 
@@ -2857,6 +3378,8 @@ class MoleculeApp:
 
         # 使用输入的分子式作为文件夹名
         formula_name = self.molecule_input.get().strip().upper()
+        if selected_indices:
+            formula_name = f"{formula_name}_selected"
         save_folder = folder_path / formula_name
         try:
             save_folder.mkdir(parents=True, exist_ok=True)
@@ -2871,23 +3394,38 @@ class MoleculeApp:
         # 在后台线程中保存
         thread = threading.Thread(
             target=self._save_isomers_in_background,
-            args=(save_folder, n_carbon, formulas, mol_names)
+            args=(save_folder, n_carbon, formulas, mol_names, indices)
         )
         thread.daemon = True
         thread.start()
 
-    def _save_isomers_in_background(self, save_folder, n_carbon, formulas, mol_names):
-        """在后台线程中保存异构体（多进程并行计算坐标）"""
+    def _save_isomers_in_background(self, save_folder, n_carbon, formulas, mol_names, selected_indices=None):
+        """在后台线程中保存异构体（多进程并行计算坐标）
+
+        Args:
+            selected_indices: 指定要导出的异构体索引列表，None 表示导出全部
+        """
         import multiprocessing
         import pickle
 
         try:
             all_isomers = self.current_isomers
-            total = len(all_isomers)
 
-            # 解析所有异构体的元数据
+            # 过滤：仅处理选中的异构体（或全部）
+            if selected_indices is not None:
+                targets = [all_isomers[i] for i in selected_indices]
+                target_indices = list(selected_indices)
+            else:
+                targets = all_isomers
+                target_indices = list(range(len(all_isomers)))
+
+            total = len(targets)
+
+            # 解析目标异构体的元数据
             tasks = []
-            for i, item in enumerate(all_isomers):
+            for idx_in_filtered, item in enumerate(targets):
+                # 使用原始异构体编号（用户看到的编号）
+                i = target_indices[idx_in_filtered]
                 if isinstance(item, tuple) and len(item) == 2:
                     mol_type, isomer_data = item
                 else:
@@ -2950,7 +3488,8 @@ class MoleculeApp:
             self._update_progress(75, "写入文件...")
             print(f"坐标计算完成，开始写入 .gjf 文件...")
 
-            for i, item in enumerate(all_isomers):
+            for idx_in_filtered, item in enumerate(targets):
+                i = target_indices[idx_in_filtered]  # 原始异构体编号
                 if self.window_closed:
                     return
 
@@ -2960,7 +3499,7 @@ class MoleculeApp:
                     mol_type = self.current_molecule_type
                     isomer_data = item
 
-                # 使用预计算的坐标
+                # 使用预计算的坐标（key 为原始索引）
                 c_coords, h_coords = coords_results.get(i, ({}, []))
 
                 # 还原图对象
@@ -2984,14 +3523,14 @@ class MoleculeApp:
                     G = None
                 content = self._generate_gjf_content(G, c_coords, h_coords, mol_type, n_carbon, i + 1)
 
-                # 写文件
+                # 写文件（使用原始编号保持与坐标一致）
                 filename = f"{formulas[mol_type]}_{mol_names.get(mol_type, mol_type)}_{i + 1:03d}.gjf"
                 filepath = save_folder / filename
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(content)
 
-                progress = int((i + 1) / total * 25) + 75
-                self._update_progress(progress, f"已保存 {i + 1}/{total}")
+                progress = int((idx_in_filtered + 1) / total * 25) + 75
+                self._update_progress(progress, f"已保存 {idx_in_filtered + 1}/{total}")
 
             # 完成
             if not self.window_closed:
