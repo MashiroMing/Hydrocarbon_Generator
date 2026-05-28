@@ -31,6 +31,7 @@
 ├── Main.py                              # 主界面（PyQt5 GUI）
 ├── utils.py                             # 分子式解析与生成分发
 ├── icon.ico                             # 应用图标
+├── molecular_constants.py               # 内部编码数据
 ├── original_programs/                   # 生成模块
 │   ├── alkane_isomer_visualizer.py      # 烷烃异构体生成与可视化
 │   ├── alkene.py                        # 烯烃异构体生成
