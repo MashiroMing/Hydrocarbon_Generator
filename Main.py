@@ -710,7 +710,7 @@ class MoleculeApp:
             ("normal", "技术栈：Python 3.11，Tkinter，RDKit，Py3Dmol"),
             ("normal", "许可协议：MIT License"),
             ("normal", "引用说明：若本工具对您的研究或工作有帮助，请引用："),
-            ("normal", "张曾继明，甘利华. (2026). 一个开源烃类异构体生成程序.化学教育"),
+            ("normal", "张曾继明，甘利华. (2026). Hydrocarbon Generator (v2.0) [计算机软件]. Zenodo. https://doi.org/10.5281/zenodo.20844657"),
             ("normal", "源代码地址：https://github.com/MashiroMing/Hydrocarbon_Generator"),
         ]
 
