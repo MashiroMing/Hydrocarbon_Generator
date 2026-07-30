@@ -1,5 +1,6 @@
 # Hydrocarbon_Generator - 分子异构体可视化工具
 
+https://zenodo.org/records/20844657
 基于 Python + PyQt5 的有机化学分子异构体生成与可视化软件，支持多种烃类的同分异构体自动生成、3D 分子结构可视化及键线式渲染。
 
 ## 功能特性
