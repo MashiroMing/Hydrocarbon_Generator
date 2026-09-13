@@ -55,6 +55,17 @@ a = Analysis(
         'original_programs.polyalkenyne',
         'utils',
         'molecular_constants',
+        # 卤素/含氧模块包
+        'halogen.Halide',
+        'oxygen.oxo_generator',
+        'oxygen.ether_bridge_generator',
+        'oxygen.oring_generator',
+        'oxygen.epoxide_generator',
+        'oxygen.peroxy_substituent_generator',
+        'oxygen.chem_filter',
+        'oxygen.atomic_matrix_gen',
+        'oxygen.unified_oxo_generator',
+        'oxygen.funcgroup',
         # 多进程（并行加速）
         'multiprocessing',
         'concurrent.futures',

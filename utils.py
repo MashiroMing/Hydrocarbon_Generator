@@ -10,6 +10,8 @@ import io
 import tempfile
 import os
 
+import networkx as nx
+
 from original_programs.multcyclomultalkane import RobustPolycyclicPolyeneGenerator, _enumerate_rdt_combinations
 from original_programs.alkane_isomer_visualizer import AlkaneIsomerGenerator, AlkaneIsomerVisualizer
 from original_programs.alkene_visualizer import AlkeneIsomerVisualizer as AlkeneViz
@@ -184,6 +186,105 @@ def parse_molecule_input(formula_str):
     return mol_types, n, m, None
 
 
+# ─────────────────────────────────────────────
+# 整合分子式解析：C{n}H{m}O{o} + 卤素 + 氘
+# ─────────────────────────────────────────────
+
+_SUPPORTED_ELEMENTS = "C、H、O 以及卤素 F、Cl、Br、I / 氘代 D"
+
+
+def parse_compound_formula(formula_str: str):
+    """解析完整分子式（含 O、卤素、氘代），返回统一结构
+
+    格式: C{n}H{m}O{o} 后跟任意顺序的卤素 (F/Cl/Br/I) 和氘 (D)
+    例: C3H6O3, C2H6OClBr, C6H6, C2H6OD, C3H6Cl2
+
+    Returns:
+        (mol_types, n_carbon, n_hydrogen, n_oxygen,
+         halogen_spec, n_deuterium, error)
+        halogen_spec: (f, cl, br, i) 元组
+    """
+    formula = formula_str.strip()
+    if not formula:
+        return None, None, None, None, None, None, "请输入分子式"
+
+    # 逐元素提取（2 字符元素优先避免 Cl/Br 误匹配为 C/B）
+    p = r'(Cl|Br|C|H|O|D|F|I)(\d*)'
+    matches = re.findall(p, formula, re.IGNORECASE)
+    if not matches:
+        return None, None, None, None, None, None, "无法识别该分子式"
+
+    counts = {'C': 0, 'H': 0, 'O': 0, 'D': 0,
+              'F': 0, 'CL': 0, 'BR': 0, 'I': 0}
+    used = set()
+    for elem, num in matches:
+        elem_upper = elem.upper()
+        if elem_upper in used:
+            return None, None, None, None, None, None, f"{elem_upper} 重复出现"
+        used.add(elem_upper)
+        cnt = int(num) if num else 1
+        counts[elem_upper] = cnt
+
+    n_carbon = counts['C']
+    n_hydrogen = counts['H']
+    n_oxygen = counts['O']
+    n_deuterium = counts['D']
+    halogen_spec = (counts['F'], counts['CL'], counts['BR'], counts['I'])
+
+    # 验证
+    if n_carbon < 1:
+        return (None, None, None, None, None, None,
+                "分子式需含碳原子。纯无机分子不在支持范围。")
+    if n_hydrogen == 0 and n_carbon >= 1:
+        # C6 不加 H 等价于 C6H?: 不允许
+        return (None, None, None, None, None, None,
+                "分子式需含氢原子，如 CH4、C2H6O")
+    # 卤素视为 H 替代参与价态/k 计算（每 Cl/Br/I 占 1H，F 也占 1H）
+    total_halogen = sum(halogen_spec)
+    total_h_equiv = n_hydrogen + total_halogen
+    if total_h_equiv > 2 * n_carbon + 2:
+        return (None, None, None, None, None, None,
+                f"H 原子数 ({n_hydrogen}) + 卤素数 ({total_halogen}) "
+                f"超出碳原子价态上限")
+    if (2 * n_carbon + 2 - total_h_equiv) % 2 != 0:
+        return (None, None, None, None, None, None,
+                "不饱和度 (k) 非整数，请检查 H 原子数")
+
+    if n_deuterium > n_hydrogen:
+        return (None, None, None, None, None, None,
+                f"氘代原子数 ({n_deuterium}) 不能超过氢原子总数")
+
+    # 验证仅支持的元素
+    for ch in formula:
+        if ch.upper() not in 'CHODFCLBRI0123456789':
+            return (None, None, None, None, None, None,
+                    f"不支持的字符 '{ch}'，仅支持 {_SUPPORTED_ELEMENTS}")
+
+    # 复用 parse_molecule_input 推导 mol_types（基于 C+H 等价骨架）
+    base_formula = f"C{n_carbon}H{total_h_equiv}"
+    mol_types, _, _, base_error = parse_molecule_input(base_formula)
+    if base_error:
+        return None, n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, base_error
+
+    return mol_types, n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, None
+
+
+def format_compound_formula(n_carbon, n_hydrogen, n_oxygen,
+                            halogen_spec, n_deuterium=0) -> str:
+    """将解析结果格式化为标准化学式字符串"""
+    parts = []
+    parts.append(f"CH{n_hydrogen}" if n_carbon == 1 else f"C{n_carbon}H{n_hydrogen}")
+    if n_oxygen > 0:
+        parts.append(f"O{n_oxygen}" if n_oxygen > 1 else "O")
+    if n_deuterium > 0:
+        parts.append(f"D{n_deuterium}" if n_deuterium > 1 else "D")
+    for elem, cnt in [('Br', halogen_spec[2]), ('Cl', halogen_spec[1]),
+                       ('F', halogen_spec[0]), ('I', halogen_spec[3])]:
+        if cnt > 0:
+            parts.append(f"{elem}{cnt}" if cnt > 1 else elem)
+    return ''.join(parts)
+
+
 def format_formula(n_carbon, n_hydrogen):
     """格式化分子式为标准化学写法：单碳时省略 1，如 CH4 而非 C1H4"""
     if n_carbon == 1:
@@ -306,13 +407,9 @@ _BOND_TYPE_MAP = {
 
 
 def graph_to_rdkit_mol(G):
-    """将 networkx.Graph（含 bond_type 属性）转换为 RDKit Mol 对象
+    """将 networkx.Graph（含 bond_type / halogen_counts / oxo_counts）→ RDKit Mol
 
-    Args:
-        G: networkx.Graph，节点为碳原子索引(0-based)，边含 bond_type 属性
-
-    Returns:
-        rdkit.Chem.rdchem.Mol 或 None（失败时）
+    节点 label='C'/'O' 区分碳骨架与醚氧骨架节点。
     """
     try:
         from rdkit import Chem
@@ -320,7 +417,7 @@ def graph_to_rdkit_mol(G):
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
 
-        n_carbons = G.number_of_nodes()
+        n_atoms = G.number_of_nodes()
         double_bonds = set()
         triple_bonds = set()
 
@@ -333,24 +430,36 @@ def graph_to_rdkit_mol(G):
                 triple_bonds.add(key)
 
         mol = Chem.RWMol()
-        for i in range(n_carbons):
-            mol.AddAtom(Chem.Atom('C'))
+        # 根据节点 label 创建原子（C 或 O 骨架）—— 按节点集合遍历避免索引间隙
+        node_to_atom_idx = {}
+        for n, data in G.nodes(data=True):
+            label = data.get('label', 'C')
+            atom_idx = mol.AddAtom(Chem.Atom(label))
+            node_to_atom_idx[n] = atom_idx
 
-        added = set()
+            added = set()
         for u, v in G.edges():
             key = (min(u, v), max(u, v))
             if key in added:
                 continue
             added.add(key)
+            u_idx, v_idx = node_to_atom_idx[u], node_to_atom_idx[v]
             if key in triple_bonds:
-                mol.AddBond(u, v, BondType.TRIPLE)
+                mol.AddBond(u_idx, v_idx, BondType.TRIPLE)
             elif key in double_bonds:
-                mol.AddBond(u, v, BondType.DOUBLE)
+                mol.AddBond(u_idx, v_idx, BondType.DOUBLE)
             else:
-                mol.AddBond(u, v, BondType.SINGLE)
+                mol.AddBond(u_idx, v_idx, BondType.SINGLE)
 
-        # 设置显式氢
+        # 添加卤素/氧取代基并设置氢原子数
+        _HALOGEN_RDKIT = ['F', 'Cl', 'Br', 'I']
+        next_idx = n_atoms
         for node in sorted(G.nodes()):
+            atom_idx = node_to_atom_idx[node]
+            label = G.nodes[node].get('label', 'C')
+            max_valence = 4 if label == 'C' else 2
+
+            # 计算键负载
             bond_load = 0
             for nb in G.neighbors(node):
                 bt = G[node][nb].get('bond_type', 'single')
@@ -360,15 +469,55 @@ def graph_to_rdkit_mol(G):
                     bond_load += 3
                 else:
                     bond_load += 1
-            h_count = 4 - bond_load
+
+            # O 骨架节点：无取代基，直接算 H
+            if label == 'O':
+                h_count = max(0, max_valence - bond_load)
+                if h_count > 0:
+                    mol.GetAtomWithIdx(atom_idx).SetNumExplicitHs(h_count)
+                continue
+
+            # ── C 节点：处理卤素 + 氧取代基 ──
+            hc = G.nodes[node].get('halogen_counts', (0, 0, 0, 0))
+            total_halogen = sum(hc)
+            for h_idx, count in enumerate(hc):
+                for _ in range(count):
+                    mol.AddAtom(Chem.Atom(_HALOGEN_RDKIT[h_idx]))
+                    mol.AddBond(atom_idx, next_idx, BondType.SINGLE)
+                    next_idx += 1
+
+            oxo = G.nodes[node].get('oxo_counts', (0, 0))
+            oh_count, co_count = oxo
+            for _ in range(oh_count):
+                mol.AddAtom(Chem.Atom('O'))
+                mol.AddBond(atom_idx, next_idx, BondType.SINGLE)
+                mol.GetAtomWithIdx(next_idx).SetNumExplicitHs(1)
+                next_idx += 1
+            for _ in range(co_count):
+                mol.AddAtom(Chem.Atom('O'))
+                mol.AddBond(atom_idx, next_idx, BondType.DOUBLE)
+                next_idx += 1
+
+            oxo_h_used = oh_count + 2 * co_count
+            h_count = max(0, max_valence - bond_load - total_halogen - oxo_h_used)
             if h_count > 0:
-                mol.GetAtomWithIdx(node).SetNumExplicitHs(h_count)
+                mol.GetAtomWithIdx(atom_idx).SetNumExplicitHs(h_count)
 
         mol = mol.GetMol()
         try:
             Chem.SanitizeMol(mol)
         except Exception:
-            return None
+            # 重试：跳过 KEKULIZE，让 RDKit 自动感知芳香性
+            try:
+                from rdkit.Chem import SanitizeFlags
+                Chem.SanitizeMol(
+                    mol,
+                    sanitizeOps=(
+                        SanitizeFlags.SANITIZE_ALL ^ SanitizeFlags.SANITIZE_KEKULIZE
+                    )
+                )
+            except Exception:
+                return None
         return mol
     except Exception:
         return None
@@ -611,3 +760,155 @@ def render_skeletal_formula(isomer_data, mol_type, gen_mgr=None, img_size=(400, 
         return buf.getvalue()
     except Exception:
         return None
+
+
+# ============================================================
+# 通用去重框架（halogen/ 与 oxygen/ 各生成器共用）
+# ============================================================
+
+def _dedup_canon_key(G, node_label_fn):
+    """WL 图哈希（节点标签由调用方 node_label_fn 编码）
+
+    Args:
+        G: networkx.Graph
+        node_label_fn: callable(node) -> str，节点标签编码函数
+    """
+    H = nx.Graph()
+    for n in G.nodes():
+        H.add_node(n, label=node_label_fn(G, n))
+    for u, v, data in G.edges(data=True):
+        H.add_edge(u, v, bond_type=data.get('bond_type', 'single'))
+    return nx.weisfeiler_lehman_graph_hash(
+        H, edge_attr='bond_type', node_attr='label'
+    )
+
+
+def _dedup_degree_signature(G, node_sig_fn):
+    """度签名（节点特征由调用方 node_sig_fn 编码），用于同构检查的预过滤"""
+    return tuple(sorted(
+        (G.degree(v), node_sig_fn(G, v))
+        for v in G.nodes()
+    ))
+
+
+def dedup_add_to_buckets(G, mol_type, buckets, node_match, node_label_fn,
+                         node_sig_fn, canon_key_fn, degree_signature_fn):
+    """将图添加到去重桶中（WL哈希→桶→度签名预过滤→is_isomorphic精确比较）
+
+    各生成器因节点/边特征不同，通过参数传入：
+        node_match / node_label_fn / node_sig_fn / canon_key_fn / degree_signature_fn
+
+    buckets: Dict[str, List[Tuple[str, nx.Graph]]]
+    """
+    h = canon_key_fn(G)
+    deg_sig = degree_signature_fn(G)
+
+    if h not in buckets:
+        buckets[h] = [(mol_type, G)]
+        return
+
+    for _, existing_G in buckets[h]:
+        if degree_signature_fn(existing_G) != deg_sig:
+            continue
+
+        def edge_match(e1, e2):
+            return e1.get('bond_type') == e2.get('bond_type')
+
+        if nx.is_isomorphic(G, existing_G,
+                            node_match=node_match,
+                            edge_match=edge_match):
+            return  # 已存在同构图
+
+    buckets[h].append((mol_type, G))
+
+
+# ============================================================
+# 分子式一致性校验（统一口径，单一事实源）
+# ============================================================
+# 所有生成器 / 展示 / 门禁的分子式统计都走 graph_formula_parts，
+# 不信任调用方传入的碳数参数（历史缺陷：compute_graph_formula 的
+# C 前缀曾直接使用调用方 n_carbon，导致桶键公式与实际图不符）。
+
+def graph_formula_parts(G):
+    """从图中统计真实分子式组成 (nC, nH, nO, (f, cl, br, i))
+
+    口径与氧取代基/卤素图表示一致（PROJECT_GUIDE 3.1 数据结构）：
+      - 节点 label='C' 最大价 4，label='O'（骨架氧）最大价 2；
+      - 键负载 bond_load = Σ(单键1 / 双键2 / 三键3)；
+      - 取代基占位：-OH 占 1 个 H 位（自身带 1 个 H），=O 占 2 个 H 位，
+        每个卤素占 1 个 H 位；
+      - h = max(0, max_v - bond_load - oh - 2*co - halo)；total_h += h + oh；
+      - nO = Σ(oxo_counts) + 骨架 O 节点数。
+    """
+    n_c = 0
+    n_o = 0
+    total_h = 0
+    total_f = total_cl = total_br = total_i = 0
+
+    for node in G.nodes():
+        label = G.nodes[node].get('label', 'C')
+        bond_load = sum(
+            3 if G[node][nb].get('bond_type') == 'triple' else
+            2 if G[node][nb].get('bond_type') == 'double' else 1
+            for nb in G.neighbors(node)
+        )
+        oh, co = G.nodes[node].get('oxo_counts', (0, 0))
+        hc = G.nodes[node].get('halogen_counts', (0, 0, 0, 0))
+        halo_on_node = sum(hc)
+
+        n_o += oh + co
+        total_f += hc[0]
+        total_cl += hc[1]
+        total_br += hc[2]
+        total_i += hc[3]
+
+        if label == 'C':
+            n_c += 1
+        elif label == 'O':
+            n_o += 1
+
+        max_v = 4 if label == 'C' else 2
+        h_on_atom = max(0, max_v - bond_load - oh - 2 * co - halo_on_node)
+        total_h += h_on_atom
+        total_h += oh  # OH 上的 H
+
+    return (n_c, total_h, n_o, (total_f, total_cl, total_br, total_i))
+
+
+def format_graph_formula(G) -> str:
+    """从图生成标准分子式字符串（与各 compute_graph_formula 口径一致）
+
+    格式: C{n}H{h}[O{o}][Br..][Cl..][F..][I..]（卤素按字母序）
+    """
+    n_c, total_h, total_o, (f, cl, br, i) = graph_formula_parts(G)
+    base = f"CH{total_h}" if n_c <= 1 else f"C{n_c}H{total_h}"
+    if total_o > 0:
+        base += f"O{total_o}" if total_o > 1 else "O"
+    for elem, cnt in [('Br', br), ('Cl', cl), ('F', f), ('I', i)]:
+        if cnt > 0:
+            base += f"{elem}{cnt}" if cnt > 1 else elem
+    return base
+
+
+def expected_formula_parts(n_carbon, n_hydrogen, n_oxygen,
+                           halogen_spec=(0, 0, 0, 0),
+                           n_deuterium=0):
+    """用户输入对应的期望分子式组成 (nC, nH, nO, (f, cl, br, i))
+
+    参数即 utils.parse_compound_formula 的解析结果（卤素视为 H 替代；
+    氘代 D 仅参与合法性校验，不进入图比较——生成器产出的是非氘代母体）。
+    """
+    return (n_carbon, n_hydrogen, n_oxygen, tuple(halogen_spec))
+
+
+def formula_matches_input(G, n_carbon, n_hydrogen, n_oxygen,
+                          halogen_spec=(0, 0, 0, 0), n_deuterium=0):
+    """分子式门禁：图 G 的真实分子式是否与用户输入完全一致
+
+    任何生成路径（=O 使 k+1、原子矩阵补漏枚举全部不饱和度、片段合并
+    改变 k 等）只要产出分子式不符的结构，该函数即返回 False。
+    """
+    if n_deuterium < 0 or n_deuterium > n_hydrogen:
+        return False
+    return graph_formula_parts(G) == expected_formula_parts(
+        n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium)

@@ -25,6 +25,14 @@ Thumbs.db
 *.bak
 temp/
 
-# CodeBuddy
+# CodeBuddy / AI assistant tooling
 .codebuddy/
+.dsh/
+.workbuddy/
+
+# AI assistant knowledge base (assistant skills, not part of the app)
+chemistry-and-biology/
+
+# Third-party external tools (clone upstream separately)
+MAYGEN/
 

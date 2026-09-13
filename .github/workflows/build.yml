@@ -1,4 +1,4 @@
-name: Build MolVis
+name: Build Hydrocarbon_Generator
 
 on:
   push:
@@ -29,10 +29,10 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller molvis_linux.spec
+          pyinstaller Hydrocarbon_Generator_linux.spec
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: molvis-linux
-          path: dist/molvis/
+          name: Hydrocarbon_Generator-linux
+          path: dist/Hydrocarbon_Generator/
