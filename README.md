@@ -1,5 +1,7 @@
 # Hydrocarbon_Generator — 有机分子异构体生成与可视化工具
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22732958.svg)](https://doi.org/10.5281/zenodo.22732958)
+
 基于 **Python + Tkinter** 的有机分子同分异构体生成与可视化软件：输入分子式，即可自动枚举全部异构体，并进行 **2D 键线式渲染**、**3D 交互可视化** 与 **Gaussian 输入文件导出**。
 
 支持 **烃类**（烷 / 烯 / 炔 / 环 / 多环等）、**含氧衍生物**（醇 / 酚 / 醚 / 醛 / 酮 / 羧酸 / 酯 / 环氧 / 过氧 / 含氧杂环等）与 **卤代烃**（F / Cl / Br / I）。
@@ -149,6 +151,16 @@ pyinstaller Hydrocarbon_Generator_linux.spec   # Linux
 产物位于 `dist/Hydrocarbon_Generator/`。如需自定义，可修改 `.spec` 中的 `name`（程序名）、`icon`（图标）、`console`（是否显示控制台）、`datas` / `hiddenimports` / `excludes` 等字段。
 
 > **注意**：请勿将 `tkinter` 加入 `excludes`，否则 GUI 无法运行。Linux 下若中文显示为方框，请安装中文字体：`sudo apt install -y fonts-wqy-zenhei fonts-noto-cjk`。
+
+## 引用
+
+若本项目对你的研究有所帮助，欢迎引用。**DOI 见下方，无需访问 Zenodo 网页即可从 README 获取**：
+
+| 项 | 地址 |
+|---|---|
+| DOI | `10.5281/zenodo.22732958` |
+| DOI 解析链接 | https://doi.org/10.5281/zenodo.22732958 |
+| 源码仓库 | https://github.com/MashiroMing/Hydrocarbon_Generator |
 
 ## License
 
