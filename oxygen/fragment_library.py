@@ -161,45 +161,6 @@ def _make_chain(atoms: list, bonds: list) -> nx.Graph:
     return G
 
 
-def _fuse_rings(ring1: nx.Graph, ring2: nx.Graph,
-                shared_edge: Tuple[int, int]) -> nx.Graph:
-    """拼接两个环，共享一条边
-
-    Args:
-        ring1, ring2: 两个独立的环图
-        shared_edge: (ring1_node, ring2_node_0, ring2_node_1)
-                     表示 ring1[shared_edge[0]] 与 ring2 的 shared_edge[1:3] 共享
-    """
-    G = ring1.copy()
-    offset = ring1.number_of_nodes()
-    r2_map = {}
-    r1_idx, r2_a, r2_b = shared_edge
-
-    # 重映射 ring2 节点（保留共享边位置）
-    r2_shared = {r2_a, r2_b}
-    r2_to_new = {}
-    for n in ring2.nodes():
-        if n == r2_a:
-            r2_to_new[n] = r1_idx
-        elif n == r2_b:
-            r2_to_new[n] = G.number_of_nodes()
-            G.add_node(G.number_of_nodes(),
-                       atom=ring2.nodes[n].get('label', 'C'))
-            G.add_edge(r1_idx, r2_to_new[n],
-                       bond_type=ring2[r2_a][r2_b].get('bond_type', 'single'))
-        else:
-            r2_to_new[n] = G.number_of_nodes()
-            G.add_node(G.number_of_nodes(),
-                       atom=ring2.nodes[n].get('label', 'C'))
-
-    for u, v, data in ring2.edges(data=True):
-        pu, pv = r2_to_new[u], r2_to_new[v]
-        if pu != r1_idx or pv not in [r2_to_new[n] for n in r2.nodes()
-                                       if n not in (r2_a, r2_b)]:
-            if not G.has_edge(pu, pv):
-                G.add_edge(pu, pv,
-                           bond_type=data.get('bond_type', 'single'))
-    return G
 
 
 # ─────────────────────────────────────────────

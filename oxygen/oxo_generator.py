@@ -16,7 +16,7 @@
 """
 
 import networkx as nx
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict
 
 from utils import _dedup_canon_key, _dedup_degree_signature, dedup_add_to_buckets
 
@@ -254,13 +254,6 @@ class OxoSubstituentGenerator:
         from utils import format_graph_formula
         return format_graph_formula(G)
 
-    @staticmethod
-    def get_total_o(G: nx.Graph) -> int:
-        """获取图中 O 原子总数"""
-        return sum(
-            sum(G.nodes[node].get('oxo_counts', (0, 0)))
-            for node in G.nodes()
-        )
 
     @staticmethod
     def has_oxygen(G: nx.Graph) -> bool:

@@ -12,8 +12,8 @@
     # → [(True, None, frag_info), ...]
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -22,9 +22,6 @@ from utils import _dedup_canon_key, _dedup_degree_signature, dedup_add_to_bucket
 # 卤素元组索引: (F, Cl, Br, I)
 HALOGEN_INDEX = {'F': 0, 'Cl': 1, 'Br': 2, 'I': 3}
 HALOGEN_NAMES = ['F', 'Cl', 'Br', 'I']
-# 分子式输出顺序（字母序）: Br → Cl → F → I
-HALOGEN_FORMULA_ORDER = ['Br', 'Cl', 'F', 'I']
-HALOGEN_COLORS = {'F': '#90E050', 'Cl': '#1FF01F', 'Br': '#A62929', 'I': '#940094'}
 
 
 def parse_halogen_spec(user_input: str) -> Tuple[int, int, int, int]:
@@ -379,21 +376,6 @@ class HalogenSubstitutionGenerator:
         from utils import format_graph_formula
         return format_graph_formula(G)
 
-    @staticmethod
-    def get_halogen_counts(G: nx.Graph) -> Tuple[int, int, int, int]:
-        """获取图中各卤素原子总数
-
-        Returns:
-            (total_f, total_cl, total_br, total_i)
-        """
-        f_total = cl_total = br_total = i_total = 0
-        for node in G.nodes():
-            hc = G.nodes[node].get('halogen_counts', (0, 0, 0, 0))
-            f_total += hc[0]
-            cl_total += hc[1]
-            br_total += hc[2]
-            i_total += hc[3]
-        return (f_total, cl_total, br_total, i_total)
 
     @staticmethod
     def has_halogen(G: nx.Graph) -> bool:
@@ -429,22 +411,6 @@ class HalogenSubstitutionGenerator:
 
 # ==================== 模块级便捷函数 ====================
 
-def enumerate_halogen_substitutions(
-        carbon_skeletons: List[Tuple[str, nx.Graph]],
-        halogen_spec: Tuple[int, int, int, int],
-        n_carbon: int) -> List[Tuple[str, nx.Graph]]:
-    """便捷函数：在碳骨架上枚举卤素取代
-
-    Args:
-        carbon_skeletons: [(mol_type, nx.Graph), ...]
-        halogen_spec: (f_total, cl_total, br_total, i_total)
-        n_carbon: 碳原子数
-
-    Returns:
-        [(mol_type, halogenated_graph), ...]
-    """
-    gen = HalogenSubstitutionGenerator()
-    return gen.generate(carbon_skeletons, halogen_spec, n_carbon)
 
 
 # ==================== 交互式命令行界面 ====================

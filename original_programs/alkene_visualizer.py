@@ -29,13 +29,12 @@
 """
 
 import os
-import sys
 import math
 import warnings
 import time
 import threading
-from typing import List, Tuple, Optional, Dict, Set
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Tuple, Optional, Dict
+from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import numpy as np
 import matplotlib.pyplot as plt
@@ -64,110 +63,8 @@ except ImportError:
 # 第一部分:图签名函数(用于同构检测和去重)
 # =========================================================================
 
-def compute_centroid_signature(G: nx.Graph, db_edge: Tuple[int, int]) -> str:
-    """
-    计算基于质心/质点的图的签名
-    
-    [功能]
-    生成一个与节点编号无关的图签名,用于判断两个图是否同构.
-    如果两个图同构,它们会产生相同的签名.
-    
-    [签名包含的信息]
-    1. 度数序列:所有节点的度数排序
-    2. 邻居度数模式:每个节点邻居的度数排序后组合
-    3. 距离分布:每个节点到所有其他节点的距离之和
-    4. 双键信息:双键两端碳原子的度数和邻居情况
-    
-    [示例]
-    对于链端烯烃和支链烯烃,虽然碳数相同,但邻居度数模式不同:
-    - 链端烯烃:-CH=CH-CH2-(中心碳邻居度数不同)
-    - 支链烯烃:-C(=CH2)-CH2-(结构不同)
-    
-    [返回值]
-    格式字符串,如 "n=5|deg=(1,2,2,2,2)|adj=..."
-    """
-
-    n = G.number_of_nodes()
-    if n == 0:
-        return "empty"
-    
-    # 1. 度数序列
-    degrees = tuple(sorted(d for _, d in G.degree()))
-    
-    # 2. 邻居度数模式
-    adj_pattern = []
-    for node in sorted(G.nodes()):
-        nbr_degrees = tuple(sorted(G.degree(nbr) for nbr in sorted(G.neighbors(node))))
-        adj_pattern.append(nbr_degrees)
-    adj_pattern = tuple(sorted(adj_pattern))
-    
-    # 3. 节点到所有其他节点的距离和(质心签名)
-    nodes = list(G.nodes())
-    node_idx = {n: i for i, n in enumerate(nodes)}
-    
-    dist_sums = []
-    for i, node in enumerate(nodes):
-        total_dist = 0
-        for j, other in enumerate(nodes):
-            if i != j:
-                try:
-                    total_dist += nx.shortest_path_length(G, node, other)
-                except nx.NetworkXNoPath:
-                    total_dist += n * 2  # 使用较大的距离
-        dist_sums.append(total_dist)
-    dist_sums = tuple(sorted(dist_sums))
-    
-    # 4. 双键信息(对称化)
-    u, v = db_edge
-    u_deg = G.degree(u)
-    v_deg = G.degree(v)
-    u_nbrs = tuple(sorted(G.degree(n) for n in G.neighbors(u) if n != v))
-    v_nbrs = tuple(sorted(G.degree(n) for n in G.neighbors(v) if n != u))
-    
-    # 对称化:确保(u,v)和(v,u)产生相同签名
-    if (u_deg, u_nbrs) < (v_deg, v_nbrs):
-        db_info = (u_deg, u_nbrs, v_deg, v_nbrs)
-    else:
-        db_info = (v_deg, v_nbrs, u_deg, u_nbrs)
-    
-    # 组合所有信息
-    return f"n={n}|deg={degrees}|adj={adj_pattern}|dist={dist_sums}|dbl={db_info}"
 
 
-def compute_canonical_labeling(G: nx.Graph) -> str:
-    """
-    计算图的规范标号(用于精确同构检测)
-    
-    [功能]
-    使用图的谱特征(拉普拉斯矩阵特征值)作为图的指纹.
-    拉普拉斯矩阵的特征值在图同构变换下保持不变.
-    
-    [算法步骤]
-    1. 构建图的拉普拉斯矩阵 L = D - A
-       D: 度数对角矩阵
-       A: 邻接矩阵
-    2. 计算 L 的特征值
-    3. 对特征值排序并四舍五入
-    
-    [优势]
-    - 计算效率高(O(n^3))
-    - 对于大多数情况足够准确
-    
-    [局限性]
-    极少数非同构图可能产生相同的特征值谱
-    此时会回退到使用度数序列
-    """
-
-    try:
-        # 尝试使用拉普拉斯特征值作为谱签名
-        L = nx.laplacian_matrix(G).todense()
-        eigenvalues = np.linalg.eigvalsh(L)
-        # 四舍五入避免浮点精度问题
-        eigenvalues = tuple(round(float(e), 6) for e in sorted(eigenvalues))
-        return str(eigenvalues)
-    except:
-        # 备用:使用度数序列
-        return str(tuple(sorted(d for _, d in G.degree())))
 
 
 # =========================================================================
@@ -352,128 +249,11 @@ class AlkaneTreeGenerator:
     # OEIS A000598 预计算值(烷基自由基数量,忽略立体异构)
     # A000598(n) = n个碳的烷基自由基 C_n H_{2n+1} 的同分异构体数
     # 定义:有根三元树(每个节点最多3个子节点)
-    # 来源: https://oeis.org/A000598
-    A000598_VALUES = {
-        0: 1,   # 索引0
-        1: 1,   # 甲基自由基
-        2: 1,   # 乙基自由基
-        3: 2,   # 丙基自由基(正丙基、异丙基)
-        4: 4,   # 丁基自由基
-        5: 8,   # 戊基自由基
-        6: 17,  # 己基自由基
-        7: 39,  # 庚基自由基
-        8: 89,  # 辛基自由基
-        9: 211, # 壬基自由基
-        10: 507, # 癸基自由基
-        11: 1238,
-        12: 3057,
-        13: 7639,
-        14: 19241,
-        15: 48865,
-    }
     
-    # 兼容旧名称
-    A000642_VALUES = A000598_VALUES
     
-    def generate_alkyl_radical_canons(self, n: int) -> List[Tuple[Dict, int]]:
-        """
-        生成 n 个碳原子的烷基自由基(OEIS A000598)
-        
-        A000598定义:有根三元树(每个节点最多3个子节点)
-        - 根节点是自由基位点(度数 <= 3,即最多3个子节点)
-        - 忽略立体异构
-        
-        返回:(邻接表, 根节点) 的列表
-        """
-        import networkx as nx
-        
-        cache_key = ('alkyl', n)
-        if cache_key in self.isomer_cache:
-            return self.isomer_cache[cache_key]
-        if n == 0: return []
-        if n == 1: return [({0: []}, 0)]
-        
-        # 生成有根三元树:根节点最多3个子节点,非根节点也最多3个子节点
-        all_rooted = self.generate_rooted_with_info(n, max_branches=3, root_max_branches=3)
-        
-        unique_adj = []
-        seen_sigs = set()
-        
-        for canon, _ in all_rooted:
-            adj = self.canon_to_adjacency(canon)
-            
-            # 验证所有节点度数 <= 4(非根节点)且根节点度数 <= 3
-            valid = True
-            for node, neighbors in adj.items():
-                deg = len(neighbors)
-                if deg > 4:  # 非根节点最大度数
-                    valid = False
-                    break
-            
-            if not valid:
-                continue
-            
-            # 计算规范化签名去重
-            sig = self._compute_rooted_signature(adj, 0)
-            if sig in seen_sigs:
-                continue
-            seen_sigs.add(sig)
-            
-            unique_adj.append((dict(adj), 0))  # 根节点是节点0
-        
-        self.isomer_cache[cache_key] = unique_adj
-        return unique_adj
     
-    def _compute_rooted_signature(self, adj: Dict, root: int) -> str:
-        """计算以root为根的树的规范化签名"""
-        def dfs(node: int, parent: int) -> tuple:
-            children = []
-            for neighbor in adj[node]:
-                if neighbor != parent:
-                    children.append(dfs(neighbor, node))
-            children.sort()
-            # 返回 (当前节点度数, 子树签名列表)
-            return (len(adj[node]), tuple(children))
-        
-        sig = dfs(root, -1)
-        return str(sig)
     
-    def _tree_canonical_key(self, adj: Dict[int, List[int]]) -> str:
-        """生成树的规范键(用于无根树去重,使用图同构)"""
-        import networkx as nx
-        
-        n = len(adj)
-        # 构建NetworkX图
-        G = nx.Graph()
-        for node, neighbors in adj.items():
-            for neighbor in neighbors:
-                if node < neighbor:
-                    G.add_edge(node, neighbor)
-        
-        # 尝试所有节点作为根,找到度数序列最小的(规范化)
-        # 使用度数信息作为初步过滤
-        degree_seq = sorted(G.degree(n) for n in G.nodes())
-        
-        # 对每个节点作为根时的度数序列进行排序
-        root_sigs = []
-        for root in range(n):
-            sig = self._compute_unrooted_tree_signature(G, root)
-            root_sigs.append(sig)
-        
-        root_sigs.sort()
-        return str(root_sigs)
     
-    def _compute_unrooted_tree_signature(self, G: nx.Graph, root: int) -> tuple:
-        """计算树的规范化签名"""
-        def dfs(node: int, parent: int) -> tuple:
-            children = []
-            for neighbor in G.neighbors(node):
-                if neighbor != parent:
-                    children.append(dfs(neighbor, node))
-            children.sort()
-            return (G.degree(node), tuple(children))
-        
-        return dfs(root, -1)
     
     def _generate_canons_internal(self, n: int, root_max_degree: int, nonroot_max_degree: int) -> List[str]:
         """内部方法:根据不同的度数约束生成规范字符串"""
@@ -784,110 +564,12 @@ def _canon_to_adj_worker(canon_str: str) -> Tuple[str, Dict[int, List[int]]]:
 
 # ========== 优化并行处理函数 ==========
 
-def _compute_signature_single(tree_adj: Dict[int, List[int]], db_edge: Tuple[int, int]) -> Optional[Tuple[nx.Graph, str, tuple]]:
-    """
-    计算单个图的签名(用于并行处理)
-    返回: (图, 完整签名, 分组签名) 或 None
-    
-    关键优化:签名字符串不依赖节点编号,确保同构结构产生相同签名
-    """
-    try:
-        import networkx as nx
-
-        G = nx.Graph()
-        G.add_nodes_from(tree_adj.keys())
-
-        for node, neighbors in tree_adj.items():
-            for neighbor in neighbors:
-                if neighbor > node:
-                    if (node, neighbor) == db_edge or (neighbor, node) == db_edge:
-                        G.add_edge(node, neighbor, bond_type='double')
-                    else:
-                        G.add_edge(node, neighbor, bond_type='single')
-
-        for node in G.nodes():
-            G.nodes[node]['label'] = 'C'
-
-        # 计算与节点编号无关的度数序列
-        degrees = tuple(sorted(G.degree(node) for node in G.nodes()))
-        
-        # 邻接度数模式(对每行排序,确保与节点编号无关)
-        adj_pattern = []
-        for node in sorted(G.nodes()):
-            nbr_degrees = tuple(sorted(G.degree(nbr) for nbr in sorted(G.neighbors(node))))
-            adj_pattern.append(nbr_degrees)
-        adj_pattern = tuple(sorted(adj_pattern))
-        
-        # 双键度数对(只使用度数,不使用节点编号)
-        # 关键:必须对称化,确保 (u_deg, v_deg) 和 (v_deg, u_deg) 产生相同结果
-        double_bond_info = []
-        for u, v, data in G.edges(data=True):
-            if data.get('bond_type') == 'double':
-                u_deg = G.degree(u)
-                v_deg = G.degree(v)
-                # 双键端点的非双键邻居度数
-                u_non_db_nbr = tuple(sorted(G.degree(n) for n in G.neighbors(u) if n != v))
-                v_non_db_nbr = tuple(sorted(G.degree(n) for n in G.neighbors(v) if n != u))
-                
-                # 对称化:度数对排序,非双键邻居也排序后比较
-                if (u_deg, u_non_db_nbr) < (v_deg, v_non_db_nbr):
-                    double_bond_info.append((u_deg, u_non_db_nbr, v_deg, v_non_db_nbr))
-                else:
-                    double_bond_info.append((v_deg, v_non_db_nbr, u_deg, u_non_db_nbr))
-        double_bond_info.sort()
-        
-        # 完整签名:使用度数信息而非节点编号
-        full_sig = f"n={len(degrees)}|deg={degrees}|adj={adj_pattern}|dbl={double_bond_info}"
-        
-        # 分组签名:用于同构预过滤(使用度数信息)
-        group_sig = (len(degrees), degrees, adj_pattern, tuple(double_bond_info))
-
-        return (G, full_sig, group_sig)
-
-    except Exception as e:
-        return None
 
 
-def _compute_signature_batch(graphs_data: List[Tuple[int, Dict[int, List[int]], Tuple[int, int]]]) -> List[Tuple[int, str, tuple]]:
-    """
-    并行计算一批图的签名
-    graphs_data: [(graph_id, tree_adj, db_edge), ...]
-    返回: [(graph_id, full_signature, group_signature, graph), ...]
-    """
-    results = []
-
-    for graph_id, tree_adj, db_edge in graphs_data:
-        result = _compute_signature_single(tree_adj, db_edge)
-        if result:
-            G, full_sig, group_sig = result
-            results.append((graph_id, full_sig, group_sig, G))
-
-    return results
 
 # ==================== 快速图签名缓存 ====================
 _graph_signature_cache = {}
 
-def get_fast_graph_signature(G):
-    """生成图的快速签名字符串"""
-    n = G.number_of_nodes()
-    if n == 0:
-        return "empty"
-
-    nodes = sorted(G.nodes())
-    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
-
-    adj_str_parts = []
-    for node in nodes:
-        neighbors = sorted([node_to_idx[nbr] for nbr in G.neighbors(node)])
-        adj_str_parts.append("_".join(map(str, neighbors)))
-
-    double_bond_edges = []
-    for u, v, data in G.edges(data=True):
-        if data.get('bond_type') == 'double':
-            double_bond_edges.append((node_to_idx[u], node_to_idx[v]))
-    double_bond_edges.sort()
-
-    return f"{n}|{'|'.join(adj_str_parts)}|{double_bond_edges}"
 
 # 配置支持中文的字体
 def configure_chinese_font():
@@ -973,9 +655,6 @@ class AlkeneIsomerVisualizer:
         self._stop_event.set()
         print("\n[中断请求] 正在停止计算...")
 
-    def resume(self):
-        """清除停止标志,继续计算"""
-        self._stop_event.clear()
 
     def is_computing(self) -> bool:
         """检查是否正在计算"""
@@ -1031,7 +710,6 @@ class AlkeneIsomerVisualizer:
         3. 异丁烯: CH2=C(CH3)2
         """
 
-        import networkx as nx
 
         if n_carbons < 2:
             return []  # C2H4 (乙烯) 没有同分异构体,但算法支持 n=2
@@ -1347,69 +1025,9 @@ class AlkeneIsomerVisualizer:
 
         return radicals
 
-    def _adjacency_to_key(self, adj: Dict) -> str:
-        """将邻接表转换为规范化字符串(用于去重)"""
-        nodes = sorted(adj.keys())
-        parts = []
-        for node in nodes:
-            neighbors = sorted(adj[node])
-            parts.append(f"{node}:{','.join(map(str, neighbors))}")
-        return "|".join(parts)
 
-    def _adjacency_with_root_key(self, adj: Dict, root: int) -> str:
-        """
-        将邻接表和根节点转换为规范化字符串(用于去重)
-        包含根节点信息,确保同一结构不同根 = 不同自由基
-        """
-        nodes = sorted(adj.keys())
-        parts = []
-        for node in nodes:
-            neighbors = sorted(adj[node])
-            parts.append(f"{node}:{','.join(map(str, neighbors))}")
-        return f"r{root}|" + "|".join(parts)
 
-    def _are_isomorphic_trees(self, adj1: Dict, adj2: Dict) -> bool:
-        """检查两棵树是否同构"""
-        import networkx as nx
 
-        G1 = nx.Graph()
-        for node, neighbors in adj1.items():
-            for neighbor in neighbors:
-                G1.add_edge(node, neighbor)
-
-        G2 = nx.Graph()
-        for node, neighbors in adj2.items():
-            for neighbor in neighbors:
-                G2.add_edge(node, neighbor)
-
-        return nx.is_isomorphic(G1, G2)
-
-    def _same_root_position(self, adj1: Dict, root1: int, adj2: Dict, root2: int) -> bool:
-        """检查两个同构树的根节点是否在拓扑上等效"""
-        import networkx as nx
-
-        # 计算从根到每个节点的路径长度分布
-        def get_distance_distribution(adj, root):
-            G = nx.Graph()
-            for node, neighbors in adj.items():
-                for neighbor in neighbors:
-                    G.add_edge(node, neighbor)
-
-            distances = {}
-            for node in G.nodes():
-                try:
-                    d = nx.shortest_path_length(G, root, node)
-                    distances[node] = d
-                except nx.NetworkXNoPath:
-                    distances[node] = -1
-
-            # 统计每个距离的节点数
-            dist_counts = {}
-            for d in distances.values():
-                dist_counts[d] = dist_counts.get(d, 0) + 1
-            return tuple(sorted(dist_counts.items()))
-
-        return get_distance_distribution(adj1, root1) == get_distance_distribution(adj2, root2)
 
     def _merge_alkyl_radicals(self, adj1: Dict, root1: int, adj2: Dict, root2: int) -> tuple:
         """
@@ -1440,35 +1058,6 @@ class AlkeneIsomerVisualizer:
 
         return merged, new_root1, new_root2
 
-    def _generate_alkene_signature(self, adj: Dict, root1: int, root2: int) -> str:
-        """
-        生成烯烃的规范化签名
-        用于快速去重比较
-        """
-        import networkx as nx
-
-        G = nx.Graph()
-        for node, neighbors in adj.items():
-            for neighbor in neighbors:
-                G.add_edge(node, neighbor)
-
-        # 标记双键节点
-        db_nodes = {root1, root2}
-
-        # 生成规范化签名:基于双键节点的最短路径结构
-        # 计算每个节点到两个双键节点的距离
-        distances = {}
-        for node in G.nodes():
-            d1 = nx.shortest_path_length(G, node, root1) if root1 in G.nodes() else 0
-            d2 = nx.shortest_path_length(G, node, root2) if root2 in G.nodes() else 0
-            deg = G.degree(node)
-            is_db = node in db_nodes
-            distances[node] = (d1, d2, deg, is_db)
-
-        # 生成度数序列签名
-        deg_seq = sorted([(distances[n][0], distances[n][1], distances[n][2], distances[n][3])
-                         for n in G.nodes()])
-        return str(deg_seq)
 
     def _build_alkene_graph(self, adj: Dict, root1: int, root2: int) -> nx.Graph:
         """
@@ -1527,7 +1116,7 @@ class AlkeneIsomerVisualizer:
         【参数/返回值同前】
         """
         import numpy as np
-        from math import sqrt, acos, cos, sin, pi
+        from math import acos, cos, sin, pi
         
         coords = [None] * n
         
@@ -1902,91 +1491,7 @@ class AlkeneIsomerVisualizer:
         return [(float(pos[i][0]), float(pos[i][1]), float(pos[i][2])) 
                 for i in range(n)]
 
-    def _force_bond_lengths_simple(self, coords, adjacency, double_bond_nodes):
-        """简单的强制键长调整 - 只移动新添加的原子，不破坏已调整好的原子"""
-        import numpy as np
-        
-        coords_array = np.array(coords, dtype=np.float64)
-        n = len(coords_array)
-        
-        def get_target_len(n1, n2):
-            is_double = (n1 in double_bond_nodes and n2 in double_bond_nodes)
-            return self.BOND_LENGTH_CC_DOUBLE if is_double else self.BOND_LENGTH_CC
-        
-        # 多次迭代调整
-        for _ in range(100):
-            max_error = 0.0
-            
-            for i in range(n):
-                for j in adjacency.get(i, []):
-                    if i >= j:
-                        continue
-                    
-                    target = get_target_len(i, j)
-                    diff = coords_array[j] - coords_array[i]
-                    dist = np.linalg.norm(diff)
-                    
-                    if dist < 1e-6:
-                        continue
-                    
-                    error = abs(dist - target)
-                    max_error = max(max_error, error)
-                    
-                    # 只调整 i 的位置（j 可能已经被调整好了）
-                    if error > 0.001:
-                        adjustment = (dist - target) * (diff / dist)
-                        coords_array[i] += adjustment * 0.5  # 渐进调整
-            
-            if max_error < 0.01:
-                break
-        
-        return coords_array  # 返回 numpy 数组
 
-    def _force_bond_lengths(self, coords, adjacency, double_bond_nodes):
-        """强制确保所有相邻原子之间的距离正确
-        
-        使用直接位置调整：直接将每个原子移动到正确的距离
-        """
-        import numpy as np
-        
-        coords_array = np.array(coords, dtype=np.float64)
-        n = len(coords_array)
-        
-        def get_target_len(n1, n2):
-            is_double = (n1 in double_bond_nodes and n2 in double_bond_nodes)
-            return self.BOND_LENGTH_CC_DOUBLE if is_double else self.BOND_LENGTH_CC
-        
-        # 多次迭代强制调整所有键长
-        for iteration in range(100):
-            max_error = 0.0
-            
-            for i in range(n):
-                for j in adjacency.get(i, []):
-                    if i >= j:
-                        continue
-                    
-                    target = get_target_len(i, j)
-                    diff = coords_array[j] - coords_array[i]
-                    dist = np.linalg.norm(diff)
-                    
-                    if dist < 1e-6:
-                        continue
-                    
-                    error = abs(dist - target)
-                    max_error = max(max_error, error)
-                    
-                    # 无条件调整，直接将距离设为目标值
-                    if error > 0.001:  # 允许0.001的误差
-                        direction = diff / dist
-                        # 移动两个原子使距离等于目标值
-                        coords_array[i] += direction * (target - dist) / 2
-                        coords_array[j] -= direction * (target - dist) / 2
-            
-            # 当所有键长误差都小于0.01时停止
-            if max_error < 0.01:
-                break
-        
-        return [tuple(c) for c in coords_array]
 
     def _calculate_tetrahedral_direction_from_one_bond(self, vec_to_existing_bond):
         """
@@ -2048,36 +1553,7 @@ class AlkeneIsomerVisualizer:
         normal /= normal_norm
         return tuple(normal)
 
-    def _calculate_sp2_direction_from_one_bond(self, vec_to_existing_bond, parent_node):
-        """根据一个已存在的键向量,计算新的 sp2 方向(120°)"""
-        v1 = vec_to_existing_bond / np.linalg.norm(vec_to_existing_bond)
-        if abs(v1[0]) < 0.9:
-            arb = np.array([1, 0, 0])
-        else:
-            arb = np.array([0, 1, 0])
-        perp = np.cross(v1, arb)
-        perp /= np.linalg.norm(perp)
-        # sp2 键角 120°,cos(120°) = -0.5
-        cos_120 = -0.5
-        sin_120 = np.sqrt(3) / 2
-        v_new = cos_120 * v1 + sin_120 * perp
-        return tuple(v_new / np.linalg.norm(v_new))
 
-    def _calculate_sp2_direction_from_two_bonds(self, vec1, vec2, parent_node):
-        """根据两个已存在的键向量,计算新的 sp2 方向"""
-        v1 = vec1 / np.linalg.norm(vec1)
-        v2 = vec2 / np.linalg.norm(vec2)
-        normal = np.cross(v1, v2)
-        normal_norm = np.linalg.norm(normal)
-        if normal_norm < 1e-6:
-            return (0.0, 0.0, 1.0)
-        normal /= normal_norm
-        # sp2 键角 120°,cos(120°) = -0.5
-        cos_120 = -0.5
-        sin_120 = np.sqrt(3) / 2
-        bisector = (v1 + v2) / np.linalg.norm(v1 + v2)
-        v_new = cos_120 * bisector + sin_120 * normal
-        return tuple(v_new / np.linalg.norm(v_new))
 
     def _compute_coords_recursive(self, node: int, parent: int,
                                    adjacency: Dict[int, List[int]],
@@ -2456,20 +1932,6 @@ class AlkeneIsomerVisualizer:
 
         return tuple(final_v4 / np.linalg.norm(final_v4))
 
-    def _calculate_tetrahedral_from_three(self, v1: np.ndarray, v2: np.ndarray, v3: np.ndarray) -> Tuple:
-        """根据三个已存在的键向量,计算新的四面体方向"""
-        v1 = v1 / np.linalg.norm(v1)
-        v2 = v2 / np.linalg.norm(v2)
-        v3 = v3 / np.linalg.norm(v3)
-
-        # 第四个方向是前三个向量和的负方向
-        v4 = -(v1 + v2 + v3)
-        v4_norm = np.linalg.norm(v4)
-
-        if v4_norm < 1e-6:
-            return tuple(-v1)
-        v4_normalized = v4 / v4_norm
-        return tuple(v4_normalized)
 
     def _generate_hydrogen_coords(self, c_coords: List[Tuple[float, float, float]],
                                  adjacency: Dict[int, List[int]],
@@ -3402,205 +2864,9 @@ class AlkeneIsomerVisualizer:
         ax.set_ylim(y_center - limit, y_center + limit)
         ax.set_zlim(z_center - limit, z_center + limit)
 
-    def _find_main_chain(self, G, adjacency, degrees, db_u, db_v):
-        """
-        使用类 IUPAC 规则查找主链:
-        1. 必须包含双键的两个碳原子
-        2. 选择最长的链
-        3. 若等长,选择取代基最多的链
-        返回: (主链节点列表, 取代基信息字典)
-        """
-        from collections import deque
 
-        # 找所有包含双键的最长路径
-        all_paths = []
 
-        def dfs_find_paths(current, target, visited, path):
-            path = path + [current]
-            visited = visited | {current}
-            if current == target:
-                all_paths.append(path)
-                return
-            for neighbor in adjacency.get(current, []):
-                if neighbor not in visited:
-                    dfs_find_paths(neighbor, target, visited, path)
 
-        dfs_find_paths(db_u, db_v, set(), [])
-
-        # 对每条路径向两端延伸以获得最长链
-        extended_paths = []
-        for path in all_paths:
-            extended = list(path)
-
-            # 向起点方向延伸
-            start = extended[0]
-            while True:
-                candidates = [nb for nb in adjacency.get(start, []) if nb not in extended]
-                if not candidates:
-                    break
-                best = min(candidates, key=lambda x: degrees.get(x, 0))
-                extended.insert(0, best)
-                start = best
-
-            # 向终点方向延伸
-            end = extended[-1]
-            while True:
-                candidates = [nb for nb in adjacency.get(end, []) if nb not in extended]
-                if not candidates:
-                    break
-                best = min(candidates, key=lambda x: degrees.get(x, 0))
-                extended.append(best)
-                end = best
-
-            extended_paths.append(extended)
-
-        if not extended_paths:
-            return [db_u, db_v], {}
-
-        # 选最长链;若等长,选取代基最多的
-        extended_paths.sort(key=lambda p: (-len(p), -sum(1 for n in p if degrees.get(n, 0) > 2)))
-        best_chain = extended_paths[0]
-
-        # 计算取代基信息
-        chain_set = set(best_chain)
-        substituents = {}
-        for i, node in enumerate(best_chain):
-            branches = [nb for nb in adjacency.get(node, []) if nb not in chain_set]
-            if branches:
-                substituents[i] = branches
-
-        return best_chain, substituents
-
-    def _detect_ez_stereochemistry(self, G, adjacency, db_u, db_v):
-        """
-        检测 E/Z 立体化学.
-        
-        对于每个 sp^2 碳原子,比较其两个非双键取代基的 Cahn-Ingold-Prelog 优先级.
-        优先级规则:比较取代基子树的大小和结构复杂度.
-        
-        返回: 'E', 'Z', 或 None(无法确定/不适用)
-        """
-        degrees_dict = {node: len(adjacency.get(node, [])) for node in adjacency}
-
-        def get_subtree_fingerprint(root, exclude_node):
-            """获取子树的详细指纹用于 CIP 优先级比较"""
-            excluded = {exclude_node}
-            def collect(node, visited):
-                visited = visited | {node}
-                children = [n for n in adjacency.get(node, []) if n not in visited and n not in excluded]
-                child_fps = tuple(sorted([collect(c, visited | {c}) for c in children]))
-                return (degrees_dict.get(node, 0), child_fps)
-            return collect(root, {root})
-
-        # 获取双键两端各自的非双键取代基
-        u_neighbors = [nb for nb in adjacency.get(db_u, []) if nb != db_v]
-        v_neighbors = [nb for nb in adjacency.get(db_v, []) if nb != db_u]
-
-        if len(u_neighbors) < 1 or len(v_neighbors) < 1:
-            return None
-
-        # 判断各端是否有不同取代基
-        u_different = False
-        v_different = False
-
-        if len(u_neighbors) >= 2:
-            fp1 = get_subtree_fingerprint(u_neighbors[0], db_v)
-            fp2 = get_subtree_fingerprint(u_neighbors[1], db_v)
-            u_different = (fp1 != fp2)
-
-        if len(v_neighbors) >= 2:
-            fp1 = get_subtree_fingerprint(v_neighbors[0], db_u)
-            fp2 = get_subtree_fingerprint(v_neighbors[1], db_u)
-            v_different = (fp1 != fp2)
-
-        if not u_different and not v_different:
-            return None
-
-        # 使用确定性哈希方法分配 E/Z 标记
-        u_fp_tuple = tuple(get_subtree_fingerprint(nb, db_v) for nb in u_neighbors)
-        v_fp_tuple = tuple(get_subtree_fingerprint(nb, db_u) for nb in v_neighbors)
-
-        combined_hash = hash((u_fp_tuple, v_fp_tuple))
-        return 'Z' if combined_hash % 2 == 0 else 'E'
-
-    def _name_linear_alkene(self, chain_len, db_pos):
-        """命名线性链烯烃"""
-        alkene_names = {
-            2: "乙烯", 3: "丙烯", 4: "丁烯", 5: "戊烯",
-            6: "己烯", 7: "庚烯", 8: "辛烯", 9: "壬烯", 10: "癸烯"
-        }
-        base = alkene_names.get(chain_len, f"{chain_len}-烯")
-        if chain_len <= 3:
-            return base
-        return f"{db_pos}-{base}"
-
-    def _name_branched_alkene(self, G, n, chain, chain_len, db_pos,
-                               substituents, db_u, db_v, degrees):
-        """
-        命名支链烯烃(通用方法)
-        
-        IUPAC 格式: 位置-取代基-双键位置-母体烯烃名
-        例如: 2-甲基-1-丁烯, 3-甲基-2-戊烯
-        """
-        alkene_names = {
-            4: "丁烯", 5: "戊烯", 6: "己烯", 7: "庚烯", 8: "辛烯"
-        }
-
-        sub_parts = []
-        for pos in sorted(substituents.keys()):
-            chain_position = pos + 1
-            num_branches = len(substituents[pos])
-
-            branch_sizes = []
-            for branch_node in substituents[pos]:
-                from collections import deque
-                visited = {branch_node} | set(chain)
-                queue = [branch_node]
-                size = 1
-                while queue:
-                    curr = queue.pop(0)
-                    for nb in G.neighbors(curr):
-                        if nb not in visited:
-                            visited.add(nb)
-                            queue.append(nb)
-                            size += 1
-                    branch_sizes.append(size)
-
-            total_branch_carbons = sum(branch_sizes)
-
-            if total_branch_carbons == 1:
-                sub_name = "甲基"
-            elif total_branch_carbons == 2:
-                sub_name = "乙基"
-            elif total_branch_carbons == 3:
-                sub_name = "丙基"
-            else:
-                sub_name = f"{total_branch_carbons}烷基"
-
-            if num_branches > 1 and total_branch_carbons == 1:
-                sub_name = "二甲基"
-            elif num_branches > 1:
-                sub_name = f"二{sub_name}"
-
-            sub_parts.append((chain_position, sub_name))
-
-        # 组装完整名称(标准 IUPAC 格式,带连字符)
-        base_name = alkene_names.get(chain_len, f"{chain_len}-烯")
-
-        if chain_len <= 3:
-            if sub_parts:
-                sub_strs = [f"{pos}-{name}" for pos, name in sub_parts]
-                full_name = "-".join(sub_strs) + base_name
-            else:
-                full_name = base_name
-        else:
-            if sub_parts:
-                sub_strs = [f"{pos}-{name}" for pos, name in sub_parts]
-                full_name = "-".join(sub_strs) + f"-{db_pos}-{base_name}"
-            else:
-                full_name = f"{db_pos}-{base_name}"
-
-        return full_name
 
     def _graph_to_structure_string(self, G, db_u, db_v):
         """
@@ -3695,7 +2961,7 @@ def main():
     print("=" * 70)
 
     try:
-        from alkene import AlkeneIsomerGenerator, AlkaneIsomerGenerator
+        pass
     except ImportError:
         print("错误: 无法导入 alkene 模块")
         return

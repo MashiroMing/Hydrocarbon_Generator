@@ -13,10 +13,8 @@ import signal
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 import networkx as nx
 
-import matplotlib
 _plt = None
 
 def _get_plt():
@@ -370,7 +368,7 @@ class AlkyneIsomerVisualizer:
         三键两端sp杂化(180°)，其他sp3杂化(109.5°四面体)
         """
         import numpy as np
-        from math import sqrt, acos, cos, sin, pi
+        from math import acos, cos, sin, pi
         
         n = G.number_of_nodes()
         if n == 0:
@@ -589,27 +587,6 @@ class AlkyneIsomerVisualizer:
         
         return coords_dict
 
-    def _calculate_coordinates_fallback(self, G: nx.Graph) -> Dict[int, Tuple[float, float, float]]:
-        """没有三键时的后备坐标计算"""
-        coords = {}
-        nodes = list(G.nodes())
-        
-        if not nodes:
-            return {}
-        
-        coords[nodes[0]] = (0.0, 0.0, 0.0)
-        
-        for node in nodes[1:]:
-            for neighbor in G.neighbors(node):
-                if neighbor in coords:
-                    coord = self._calculate_sp3_child_coord(G, coords, node, neighbor)
-                    if coord is not None:
-                        coords[node] = coord
-                        break
-            if node not in coords:
-                coords[node] = (len(coords) * 1.5, 0.0, 0.0)
-        
-        return coords
 
     def _apply_nonbonded_repulsion(self, coords: Dict, G: nx.Graph) -> Dict:
         """对非键连原子施加强力排斥力，消除视觉上的"假环"
@@ -745,46 +722,6 @@ class AlkyneIsomerVisualizer:
         
         return result
 
-    def _calculate_sp3_child_coord(
-        self, 
-        G: nx.Graph, 
-        coords: Dict[int, np.ndarray],
-        child: int, 
-        parent: int
-    ) -> np.ndarray:
-        """计算sp3碳子节点的坐标（四面体结构，109.5°键角）"""
-        p_coords = coords[parent]
-        
-        siblings = [nb for nb in G.neighbors(parent) if nb in coords and nb != child]
-        bond_len = self.BOND_LENGTH_CC
-        depth = self._calculate_node_depth(coords, child, parent)
-        
-        if not siblings:
-            if depth % 3 == 0:
-                direction = np.array([1.0, 0.0, 0.0])
-            elif depth % 3 == 1:
-                direction = np.array([0.0, 1.0, 0.0])
-            else:
-                direction = np.array([0.0, 0.0, 1.0])
-        elif len(siblings) == 1:
-            direction = self._tetrahedral_one_bond_v3(p_coords - coords[siblings[0]], depth)
-        elif len(siblings) == 2:
-            direction = self._tetrahedral_two_bonds_v3(
-                p_coords - coords[siblings[0]],
-                p_coords - coords[siblings[1]],
-                depth
-            )
-        elif len(siblings) == 3:
-            direction = self._tetrahedral_three_bonds(
-                p_coords - coords[siblings[0]],
-                p_coords - coords[siblings[1]],
-                p_coords - coords[siblings[2]]
-            )
-        else:
-            direction = np.array([1.0, 0.0, 0.0])
-        
-        direction = direction / np.linalg.norm(direction)
-        return p_coords + direction * bond_len
     
     def _calculate_node_depth(self, coords: Dict[int, np.ndarray], 
                                child: int, parent: int) -> int:
@@ -1201,8 +1138,8 @@ class AlkyneIsomerVisualizer:
         triple_edges: List[Tuple]
     ):
         """绘制分子结构"""
-        n = G.number_of_nodes()
-        triple_edges_set = set(triple_edges)
+        G.number_of_nodes()
+        set(triple_edges)
         
         # 绘制 C-C 键
         for u, v, data in G.edges(data=True):
@@ -1429,22 +1366,6 @@ def main():
         print("没有找到异构体")
 
 
-def test():
-    """测试函数：验证 OEIS 数据"""
-    print("\n" + "=" * 60)
-    print("OEIS A000642 验证测试")
-    print("=" * 60)
-    
-    gen = AlkyneIsomerGenerator()
-    expected = {2: 1, 3: 1, 4: 2, 5: 3, 6: 7, 7: 14, 8: 32}
-    
-    for n, exp_count in expected.items():
-        isomers = gen.generate_isomers(n)
-        actual = len(isomers)
-        status = "[OK]" if actual == exp_count else f"[FAIL] (预期 {exp_count})"
-        print(f"C{n}: {actual} {status}")
-    
-    print("=" * 60)
 
 
 if __name__ == "__main__":

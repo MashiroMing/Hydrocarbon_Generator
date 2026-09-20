@@ -5,12 +5,15 @@
 n≥15时自动启用并行计算加速。OEIS验证: C1=1,C2=1,C3=1,C4=2,C5=3,C6=5,C7=9,C8=18,C9=35,C10=75。
 """
 
-import os, sys, math, warnings, signal, io, traceback
+import os
+import sys
+import math
+import warnings
+import signal
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 import itertools
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
+from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 
 try:
@@ -1721,7 +1724,6 @@ class AlkaneIsomerVisualizer:
         【返回值】
           调整后的氢原子坐标列表
         """
-        import random
         
         fixed_h = [np.array(h, dtype=np.float64) for h in h_coords]
         n_h = len(fixed_h)

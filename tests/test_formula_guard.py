@@ -28,8 +28,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import networkx as nx
 
-from utils import (parse_compound_formula, graph_formula_parts,
-                   formula_matches_input, format_graph_formula)
+from utils import (parse_compound_formula, formula_matches_input,
+                   format_graph_formula)
 from structure_filter import filter_by_expected_formula, StructureConstraint
 from oxygen.unified_oxo_generator import UnifiedOxoGenerator
 

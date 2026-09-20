@@ -12,7 +12,7 @@ O 原子作为骨架节点（label='O'），与两侧 C 单键连接。
 """
 import itertools
 import networkx as nx
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict
 
 from utils import _dedup_canon_key, _dedup_degree_signature, dedup_add_to_buckets
 

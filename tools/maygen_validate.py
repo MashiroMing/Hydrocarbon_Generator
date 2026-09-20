@@ -197,7 +197,7 @@ def validate(formula, top_missing=10):
     print("[3/3] 对比...")
     missing = sorted(maygen_set - ours_set)
     extra = sorted(ours_set - maygen_set)
-    union = maygen_set | ours_set
+    maygen_set | ours_set
     coverage = (len(ours_set & maygen_set) / len(maygen_set)
                 if maygen_set else 0.0)
     print(f"  交集: {len(ours_set & maygen_set)}")

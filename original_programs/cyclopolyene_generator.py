@@ -13,10 +13,9 @@
   gen.generate_all_layers(6)     # 生成所有层级
 """
 
-from typing import List, Dict, Tuple
+from typing import List, Dict
 import sys
 from pathlib import Path
-from collections import defaultdict
 
 import networkx as nx
 
@@ -131,17 +130,8 @@ class CyclopolyeneGenerator:
 
         return results
 
-    def generate_cycloalkene(self, n_carbons: int) -> List[nx.Graph]:
-        """生成单环单烯烃异构体 (CnH2n-2)"""
-        return self.generate_k_cycloene(n_carbons, 1)
 
-    def generate_cyclo_diene(self, n_carbons: int) -> List[nx.Graph]:
-        """生成单环二烯烃异构体 (CnH2n-4)"""
-        return self.generate_k_cycloene(n_carbons, 2)
 
-    def generate_cyclo_triene(self, n_carbons: int) -> List[nx.Graph]:
-        """生成单环三烯烃异构体 (CnH2n-6)"""
-        return self.generate_k_cycloene(n_carbons, 3)
 
     def generate_k_cycloene(self, n_carbons: int, k: int) -> List[nx.Graph]:
         """
@@ -592,7 +582,6 @@ class CyclopolyeneGenerator:
             matplotlib.use('TkAgg')
             import matplotlib.pyplot as plt
             import numpy as np
-            from rdkit import Chem
         except ImportError as e:
             print(f"可视化依赖缺失: {e}")
             return False

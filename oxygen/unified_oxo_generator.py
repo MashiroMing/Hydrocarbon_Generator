@@ -11,7 +11,6 @@ O 分配策略:
 import networkx as nx
 from typing import Dict, Tuple, List
 from collections import defaultdict
-import itertools
 
 from oxygen.oxo_generator import OxoSubstituentGenerator
 from oxygen.ether_bridge_generator import BridgeGenerator

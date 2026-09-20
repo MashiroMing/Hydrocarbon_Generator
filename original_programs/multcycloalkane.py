@@ -13,12 +13,11 @@ OEIS 验证：
 import sys
 import re
 from pathlib import Path
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, Counter
 import warnings
 
 import networkx as nx
-import numpy as np
 
 # 将项目根目录加入 sys.path，方便导入原模块
 _current_file = Path(__file__).resolve()
@@ -256,9 +255,7 @@ class PolycycloalkaneGenerator:
     def visualize_isomer(self, G: nx.Graph, title: str = "") -> bool:
         """使用 RDKit + matplotlib 弹出3D可视化窗口"""
         try:
-            import matplotlib
             import matplotlib.pyplot as plt
-            from rdkit import Chem
         except ImportError as e:
             print(f"可视化依赖缺失: {e}")
             print("请安装: pip install matplotlib rdkit")

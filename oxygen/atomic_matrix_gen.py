@@ -9,7 +9,7 @@
 
 import networkx as nx
 import time
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 
 
@@ -29,14 +29,6 @@ def _bond_valence(bt: int) -> int:
     return bt
 
 
-def _count_graph_valences(M: List[List[int]], atom_types: List[str]) -> int:
-    """已用价电子总和"""
-    total = 0
-    N = len(atom_types)
-    for i in range(N):
-        for j in range(i + 1, N):
-            total += M[i][j]
-    return total
 
 
 def _is_graph_connected(M: List[List[int]], N: int) -> bool:

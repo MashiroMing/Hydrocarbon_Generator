@@ -135,12 +135,6 @@ def dbe_from_graph(G: nx.Graph) -> float:
     return dbe_from_parts(n_c, n_h, n_n)
 
 
-def graph_valences(G: nx.Graph) -> int:
-    """图总价态（重原子）"""
-    total = 0
-    for _, d in G.nodes(data=True):
-        total += VALENCE.get(d.get('label', 'C'), 0)
-    return total
 
 
 def is_valence_legal(G: nx.Graph) -> bool:

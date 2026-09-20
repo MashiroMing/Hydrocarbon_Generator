@@ -14,7 +14,7 @@
 """
 
 import networkx as nx
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 
 
 # ============ 规则定义 ============
@@ -42,11 +42,7 @@ class ChemFilter:
         elif chem_mode != 'chem':
             raise ValueError("chem_mode 必须为 'math' 或 'chem'")
 
-    def disable(self, rule_name: str):
-        self.disabled.add(rule_name)
 
-    def enable(self, rule_name: str):
-        self.disabled.discard(rule_name)
 
     # ── 过滤入口 ──
 
@@ -167,28 +163,3 @@ class ChemFilter:
 
 # ============ 多 O 组合重排检测 ============
 
-def detect_redundant_combinations(G: nx.Graph) -> List[str]:
-    """检测图中可能因多 O 组合产生的冗余特征。
-
-    返回警告列表（不影响过滤结果），用于调试诊断。
-    """
-    warnings = []
-    o_count = sum(1 for n in G.nodes()
-                  if G.nodes[n].get('label', 'C') == 'O')
-    oh_total = sum(G.nodes[n].get('oxo_counts', (0, 0))[0]
-                   for n in G.nodes())
-    co_total = sum(G.nodes[n].get('oxo_counts', (0, 0))[1]
-                   for n in G.nodes())
-
-    # 邻位 OH 过多
-    for u, v in G.edges():
-        oh_u = G.nodes[u].get('oxo_counts', (0, 0))[0]
-        oh_v = G.nodes[v].get('oxo_counts', (0, 0))[0]
-        if oh_u >= 1 and oh_v >= 1:
-            warnings.append(f"vicinal_diol: C{u}-C{v} both have OH")
-
-    # O 骨架过密
-    if o_count > sum(1 for n in G.nodes() if G.nodes[n].get('label', 'C') == 'C'):
-        warnings.append("o_dense: more O than C in backbone")
-
-    return warnings

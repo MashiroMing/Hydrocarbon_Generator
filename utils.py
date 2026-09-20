@@ -7,8 +7,6 @@
 
 import re
 import io
-import tempfile
-import os
 
 import networkx as nx
 
@@ -269,20 +267,6 @@ def parse_compound_formula(formula_str: str):
     return mol_types, n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, None
 
 
-def format_compound_formula(n_carbon, n_hydrogen, n_oxygen,
-                            halogen_spec, n_deuterium=0) -> str:
-    """将解析结果格式化为标准化学式字符串"""
-    parts = []
-    parts.append(f"CH{n_hydrogen}" if n_carbon == 1 else f"C{n_carbon}H{n_hydrogen}")
-    if n_oxygen > 0:
-        parts.append(f"O{n_oxygen}" if n_oxygen > 1 else "O")
-    if n_deuterium > 0:
-        parts.append(f"D{n_deuterium}" if n_deuterium > 1 else "D")
-    for elem, cnt in [('Br', halogen_spec[2]), ('Cl', halogen_spec[1]),
-                       ('F', halogen_spec[0]), ('I', halogen_spec[3])]:
-        if cnt > 0:
-            parts.append(f"{elem}{cnt}" if cnt > 1 else elem)
-    return ''.join(parts)
 
 
 def format_formula(n_carbon, n_hydrogen):
@@ -571,7 +555,6 @@ def _render_methane_label(img_size=(400, 300)):
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import numpy as np
 
         w_inch = img_size[0] / 120.0
         h_inch = img_size[1] / 120.0
@@ -642,7 +625,6 @@ def render_skeletal_formula(isomer_data, mol_type, gen_mgr=None, img_size=(400, 
         bytes (PNG 图片数据) 或 None（渲染失败时）
     """
     import networkx as nx
-    from rdkit import Chem
     from rdkit.Chem import AllChem
     from rdkit import RDLogger
     RDLogger.DisableLog('rdApp.*')

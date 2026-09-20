@@ -473,9 +473,7 @@ class RobustPolycyclicPolyeneGenerator:
     def visualize_isomer(self, G: nx.Graph, title: str = "") -> bool:
         """使用 RDKit + matplotlib 弹出3D可视化窗口"""
         try:
-            import matplotlib
             import matplotlib.pyplot as plt
-            from rdkit import Chem
         except ImportError as e:
             print(f"可视化依赖缺失: {e}")
             print("请安装: pip install matplotlib rdkit")
@@ -515,7 +513,7 @@ class RobustPolycyclicPolyeneGenerator:
         # 标记环内边
         ring_edges = set()
         for ci, cycle in enumerate(cycles):
-            cycle_set = set(cycle)
+            set(cycle)
             for j in range(len(cycle)):
                 u = cycle[j]
                 v = cycle[(j + 1) % len(cycle)]

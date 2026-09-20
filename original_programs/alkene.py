@@ -52,7 +52,6 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np                     # 数值计算
 import itertools                        # 迭代器工具
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
 import multiprocessing as mp            # 多进程并行计算
 import matplotlib.pyplot as plt         # 绘图
 from matplotlib.gridspec import GridSpec  # 子图网格布局
@@ -90,7 +89,6 @@ sys.excepthook = _custom_excepthook
 # 第三部分：matplotlib延迟导入
 # ============================================================
 
-import matplotlib
 _plt = None
 _GridSpec = None
 _cm = None
@@ -128,83 +126,11 @@ configure_chinese_font()
 # 使用简单的图字符串表示作为快速哈希
 _graph_signature_cache = {}
 
-def get_fast_graph_signature(G):
-    """
-    生成图的快速签名字符串
-    使用邻接矩阵和双键位置的组合作为签名
-    """
-    # 获取节点数
-    n = G.number_of_nodes()
-    if n == 0:
-        return "empty"
-
-    # 获取排序后的节点列表
-    nodes = sorted(G.nodes())
-    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
-
-    # 生成邻接矩阵字符串
-    adj_str_parts = []
-    for node in nodes:
-        neighbors = sorted([node_to_idx[nbr] for nbr in G.neighbors(node)])
-        adj_str_parts.append("_".join(map(str, neighbors)))
-
-    # 获取双键信息（使用节点索引而非节点ID）
-    double_bond_edges = []
-    for u, v, data in G.edges(data=True):
-        if data.get('bond_type') == 'double':
-            double_bond_edges.append((node_to_idx[u], node_to_idx[v]))
-    double_bond_edges.sort()
-
-    # 组合所有信息
-    return f"{n}|{'|'.join(adj_str_parts)}|{double_bond_edges}"
 configure_chinese_font()
 
 # ==================== 模块级并行工作函数 ====================
 # 这些函数必须在模块级别定义，以便Windows的multiprocessing可以正常工作
 
-def check_isomorphism_worker(G, canonical_forms_bytes_list):
-    """
-    并行工作函数：检查一个图是否与已有图同构
-    这个函数在子进程中运行，必须接收可序列化的参数
-    """
-    def custom_edge_match(e1, e2):
-        """自定义边匹配：严格比较 bond_type 是否完全相同"""
-        return e1.get('bond_type') == e2.get('bond_type')
-
-    try:
-        # 将字节列表转换回图对象
-        canonical_forms = []
-        for graph_bytes in canonical_forms_bytes_list:
-            try:
-                G_restored = nx.node_link_graph(graph_bytes)
-                canonical_forms.append(G_restored)
-            except:
-                continue
-
-        # 为节点添加标签属性
-        for node in G.nodes():
-            G.nodes[node]['label'] = 'C'
-
-        # 检查是否与已有的图同构
-        for existing_graph in canonical_forms:
-            try:
-                gm = nx.isomorphism.GraphMatcher(
-                    G,
-                    existing_graph,
-                    node_match=nx.isomorphism.categorical_node_match('label', 'C'),
-                    edge_match=custom_edge_match
-                )
-                if gm.is_isomorphic():
-                    return (False, None)  # 同构，不添加
-            except Exception:
-                continue
-
-        # 不同构，返回图的序列化形式
-        graph_bytes = nx.node_link_data(G)
-        return (True, graph_bytes)
-
-    except Exception as e:
-        return (False, None)
 
 # ==================== 导入原有类 ====================
 class AlkaneIsomerGenerator:
@@ -1323,7 +1249,7 @@ def main():
 
                         structure_info = []
                         for node in sorted(iso.nodes()):
-                            neighbors = list(iso.neighbors(node))
+                            list(iso.neighbors(node))
                             structure_info.append(f"C{node+1}({degrees[node]})")
                         print(f"   Structure: {'-'.join(structure_info)}")
                     else:
