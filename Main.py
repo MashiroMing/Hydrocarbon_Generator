@@ -4,7 +4,6 @@
 """
 
 import sys
-import os
 import io
 from pathlib import Path
 from molecular_constants import B64_SHOKO_CN, B64_SHOKO_EN
@@ -39,13 +38,11 @@ def _threadsafe_image_del(self):
 tk.Image.__del__ = _threadsafe_image_del
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # 导入分子式解析与生成分发工具
 from utils import (
     GeneratorManager,
-    parse_molecule_input,
     compute_formula,
     format_formula,
     MOL_NAMES_CN,
@@ -57,18 +54,24 @@ from utils import (
 # 导入卤代烃生成模块
 from halogen.Halide import (
     HalogenSubstitutionGenerator,
-    parse_halogen_spec,
     format_halogen_spec,
-    HALOGEN_NAMES,
 )
 
 # 导入统一含氧生成模块
 from oxygen.unified_oxo_generator import UnifiedOxoGenerator
 
+# 导入 Gaussian .gjf 输入卡生成器（唯一出口，见 gaussian_export.py 模块文档）
+from gaussian_export import (
+    GjfSettings,
+    build_gjf,
+    compose_route_line,
+    load_settings as load_gjf_settings,
+    save_settings as save_gjf_settings,
+    settings_path as gjf_settings_path,
+)
+
 # 键线式渲染特性检测
 try:
-    from rdkit.Chem.Draw import rdMolDraw2D
-    import cairosvg
     from PIL import Image, ImageTk
     HAS_SKELETAL_DRAWING = True
 except ImportError:
@@ -81,9 +84,6 @@ def _parallel_compute_coords(args):
 
     try:
         import networkx as nx
-        import numpy as np
-        from rdkit import Chem
-        from rdkit.Chem import AllChem, BondType
         from rdkit import RDLogger
         RDLogger.DisableLog('rdApp.*')
 
@@ -244,7 +244,6 @@ def _rdkit_coords_single(G):
 def _rdkit_coords_with_bonds(G, double_only=True):
     """RDKit构建含多重键分子并生成3D坐标（含回退方案）"""
     import networkx as nx
-    from rdkit import Chem
     from rdkit.Chem import AllChem
     from rdkit import RDLogger
     RDLogger.DisableLog('rdApp.*')
@@ -315,11 +314,10 @@ def _fallback_coords_from_graph(G):
 
     # 检测环结构
     cycles = nx.cycle_basis(G)
-    cycle_nodes = set()
     main_cycle = cycles[0] if cycles else []
 
     if main_cycle:
-        cycle_nodes = set(main_cycle)
+        set(main_cycle)
         # 环上节点：等间距放置在圆上
         ring_len = len(main_cycle)
         for idx, node in enumerate(main_cycle):
@@ -374,7 +372,6 @@ def _fallback_coords_from_graph(G):
 
 def _extract_coords(mol):
     """从RDKit分子对象提取碳/氢坐标"""
-    from rdkit import Chem
     conf = mol.GetConformer()
     c_coords = {}
     h_coords = []
@@ -386,6 +383,33 @@ def _extract_coords(mol):
         else:
             h_coords.append(coord)
     return c_coords, h_coords
+
+
+#: 化学上「所有键必为单键」的分子类型。规范字符串不携带键级信息，
+#: 只有这些类型可以安全地按单键还原；其余类型若以字符串形式出现，
+#: 键级不可知，应保持无 bond_type 以便 gaussian_export 降级拒写连通性。
+_SINGLE_BOND_ONLY_TYPES = frozenset({'alkane', 'cycloalkane', 'multcycloalkane'})
+
+
+def _graph_from_adjacency(adj, mol_type=None):
+    """邻接表 → networkx 图。
+
+    对 :data:`_SINGLE_BOND_ONLY_TYPES` 显式标注 ``bond_type='single'``
+    （化学上确定，可安全用于 Gaussian 连通性块）；其余类型**不标注**，
+    让 ``gaussian_export`` 的守卫判定键级不可信而整体降级，避免把
+    C=C/C≡C 误写成单键提交给 Gaussian。
+    """
+    import networkx as nx
+
+    G = nx.Graph()
+    single = mol_type in _SINGLE_BOND_ONLY_TYPES
+    for node, neighbors in adj.items():
+        for neighbor in neighbors:
+            if single:
+                G.add_edge(node, neighbor, bond_type='single')
+            else:
+                G.add_edge(node, neighbor)
+    return G
 
 
 def _compute_bond_load(G, node):
@@ -666,7 +690,6 @@ class MoleculeApp:
         self.current_isomers = []
         self.current_molecule_type = None
         self.current_carbon_count = None
-        self._filter_data = []  # 存储筛选数据 [(主链长度, 索引), ...]
         self._display_meta = []  # 每个异构体的展示元数据 (formula, cn_name, feature, fg_tags, o_dist)
 
         # 含氧官能团筛选面板状态（_update_fg_panel / 布局处创建）
@@ -676,11 +699,7 @@ class MoleculeApp:
         self._o_dist_var = None   # StringVar: '全部' | O_DIST_CN 中文名
         # 官能团标签惰性缓存（大集合后台分块计算，不阻塞界面）
         self._fg_tags_cache = []  # [None | (tags, o_dist)]，与 _display_meta 对齐
-        self._fg_computed = 0     # 已计算行数
-        self._fg_thread_busy = False
 
-        # 生成控制
-        self.is_generating = False
         self.cancel_requested = False
 
         # 解析后的分子参数（由 _on_molecule_input_changed 填充）
@@ -739,6 +758,10 @@ class MoleculeApp:
             ("normal", "点击【可视化当前分子】按钮，即可在新窗口中查看该分子的 3D 交互模型（支持旋转）"),
             ("bold", "2.6  另存为"),
             ("normal", "可以将选中的分子导出为 Gaussian 输入文件（.gjf）"),
+            ("normal", "导出格式：Link 0（%Chk/%Mem/%NProcShared）→ route（#，含方法/基组）"),
+            ("normal", "→ 标题 → 电荷 自旋多重度 → 坐标 → 连通性块（Geom=Connectivity，保留键级）"),
+            ("normal", "点击【Gaussian 设置】可配置方法/基组、电荷/多重度、内存与核数；"),
+            ("normal", "电荷为 0 且多重度为 1 时即中性闭壳层分子；开壳层/离子须改这里再导出"),
             ("bold", "2.7  快捷键与操作技巧"),
             ("normal", "• Ctrl + 单击 — 多选列表中的异构体"),
             ("normal", "• Shift + 单击 — 范围选择"),
@@ -852,7 +875,6 @@ class MoleculeApp:
         # 兼容属性：从统一生成器内部获取子模块（用于可视化/坐标计算等）
         self.multcycloalkane_generator = self.unified_generator.ring_gen
         self.cyclopolyene_generator = self.unified_generator.cyclopolyene_gen
-        self.diene_generator = self.unified_generator.polyenyne_gen
 
         # 炔烃可视化器（独立实例，用于坐标计算和可视化）
         from original_programs.alkyne import AlkyneIsomerVisualizer
@@ -1166,6 +1188,17 @@ class MoleculeApp:
         )
         self.save_btn.pack(side=tk.LEFT, padx=5)
 
+        # Gaussian 导出设置（方法/基组、电荷/多重度、Link 0）
+        self.gjf_settings_btn = ttk.Button(
+            viz_frame,
+            text="Gaussian 设置",
+            command=self._open_gjf_settings_dialog,
+        )
+        self.gjf_settings_btn.pack(side=tk.LEFT, padx=5)
+        self._gjf_settings_tooltip = CreateToolTip(
+            self.gjf_settings_btn,
+            "配置 .gjf 导出的方法/基组、电荷/多重度与 Link 0")
+
         self.compare_btn = ttk.Button(
             viz_frame,
             text="比较选中异构体",
@@ -1184,20 +1217,7 @@ class MoleculeApp:
         )
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    def _on_type_changed(self):
-        """分子类型改变时的处理（已弃用，保留兼容）"""
-        pass
 
-    def _parse_molecule_input(self, formula_str):
-        """解析分子式输入（委托给 utils.parse_molecule_input）
-
-        返回: (mol_types, n_carbon, error_msg)
-            mol_types: 分子类型列表，如 ['alkene', 'cycloalkane'] 或 ['alkane']
-            n_carbon: 碳原子数
-            error_msg: 错误信息，无错误时为 None
-        """
-        mol_types, n, m, error = parse_molecule_input(formula_str)
-        return mol_types, n, error
 
     def _update_type_filter_visibility(self, mol_types=None):
         """更新类型筛选区域的显示
@@ -1297,9 +1317,6 @@ class MoleculeApp:
         except Exception:
             pass
 
-    def _on_carbon_changed(self):
-        """碳原子数改变时的处理（已弃用）"""
-        pass
 
     # -----------------------------------------------------------------
     # 高级筛选对话框
@@ -1684,8 +1701,6 @@ class MoleculeApp:
                 messagebox.showwarning("输入错误", f"所选类型与分子式不匹配")
                 return
 
-        # 重置状态
-        self.is_generating = True
         self.cancel_requested = False
 
         # 更新界面状态
@@ -1946,31 +1961,6 @@ class MoleculeApp:
             if not self.window_closed:
                 self.root.after(0, self._show_error, str(e))
 
-    def _generate_alkane_with_progress(self, generator, n_carbon):
-        """带进度追踪的烷烃生成"""
-        import time
-
-        # 分阶段模拟进度
-        stages = [
-            (10, "生成中...", 0.15),
-            (35, "去重处理中...", 0.4),
-            (60, "整理结果中...", 0.6),
-            (80, "完成准备...", 0.85),
-        ]
-
-        isomers = []
-        for progress, label, _ in stages:
-            if self.cancel_requested or self.window_closed:
-                break
-            self._update_progress(progress, label)
-            time.sleep(0.3)  # 给 UI 更新的时间
-
-        if not self.cancel_requested and not self.window_closed:
-            self._update_progress(85, "实际生成异构体...")
-            isomers = generator.generate_isomers(n_carbon)
-            self._update_progress(100, f"生成完成，共 {len(isomers)} 个")
-
-        return isomers
 
     def _update_progress(self, value, label):
         """更新进度条（在线程中调用），同时输出到终端"""
@@ -2216,12 +2206,10 @@ class MoleculeApp:
                       and len(self._fg_tags_cache) == n):
             return
         self._fg_tags_cache = [None] * n
-        self._fg_computed = 0
         if n <= 3000:
             self._compute_fg_tags_range(0, n)
             self._refresh_fg_panel()
         else:
-            self._fg_thread_busy = True
             import threading
             threading.Thread(target=self._fg_tags_worker, args=(n,),
                              daemon=True).start()
@@ -2236,7 +2224,6 @@ class MoleculeApp:
                 self._compute_fg_tags_range(start, min(start + step, n))
                 self.root.after(0, self._refresh_fg_panel)
         finally:
-            self._fg_thread_busy = False
             if not self.window_closed:
                 # 完成后重填一次，让行尾标签补齐
                 self.root.after(0, self._repopulate_from_current_filter)
@@ -2250,7 +2237,6 @@ class MoleculeApp:
             if not hasattr(G, 'nodes'):
                 continue
             self._fg_tags_cache[i] = (classify(G), o_distribution(G))
-            self._fg_computed += 1
 
     def _refresh_fg_panel(self):
         """从缓存重算面板计数（生成后 / 分块计算完成后调用，主线程）"""
@@ -2319,8 +2305,6 @@ class MoleculeApp:
         try:
             total_halogen = sum(halogen_spec)
 
-            # 重置生成状态
-            self.is_generating = False
             self.generate_btn.config(state=tk.NORMAL)
             self.cancel_btn.config(state=tk.DISABLED)
             self.compare_btn.config(state=tk.DISABLED)
@@ -2521,7 +2505,7 @@ class MoleculeApp:
             # 优化：对于恰好含一个环的图，环长 = 边数 - 节点数 + 1
             # 更快的方式：直接用 cycle_basis，但先尝试用度数<=2的节点剥离法
             n_nodes = G.number_of_nodes()
-            n_edges = G.number_of_edges()
+            G.number_of_edges()
             # 对于恰好含一个环的连通图: 环长 = n_edges - n_nodes + 1
             # 但这是 cyclomatic number，不等于环长
             # 使用更高效的方法：逐步剥离去叶节点
@@ -2577,7 +2561,6 @@ class MoleculeApp:
         isomers: [(mol_type, data), ...] 或 data 列表。特征值优先复用
         _display_meta 缓存（避免重复计算主链长度/环大小）。
         """
-        import networkx as nx
         
         # 计算每个异构体的主链长度/环大小（复用 _display_meta 缓存）
         chain_lengths = []
@@ -2630,8 +2613,6 @@ class MoleculeApp:
         self.filter_combo['values'] = ["全部"] + [str(x) for x in unique_lengths]
         self.filter_result_var.set(f"(共 {len(isomers)} 个)")
         
-        # 存储筛选数据
-        self._filter_data = list(zip(chain_lengths, list(range(len(isomers)))))
 
     def _on_filter_changed(self, event):
         """筛选条件改变时的处理（复用统一填充逻辑）"""
@@ -2826,7 +2807,7 @@ class MoleculeApp:
         try:
             from PIL import Image
             import io as io_pil
-            img = Image.open(io_pil.BytesIO(self._skeletal_png_data))
+            Image.open(io_pil.BytesIO(self._skeletal_png_data))
 
             # Windows: 通过 Win32 API 复制 PNG 到剪贴板
             import subprocess
@@ -2883,7 +2864,6 @@ class MoleculeApp:
     def _get_graph_info_text(self, G, idx, mol_type, formulas,
                               halogen_formula=None):
         """获取图的详细信息文本（支持卤素 + 含氧信息）"""
-        import networkx as nx
 
         mol_names = MOL_NAMES_FILTER
         has_halogen = halogen_formula is not None
@@ -3026,7 +3006,6 @@ class MoleculeApp:
             氢原子坐标列表 [(x, y, z), ...]，按碳原子顺序排列
         """
         import numpy as np
-        import math
 
         n_c = G.number_of_nodes()
         ring_set = set(main_cycle) if main_cycle else set()
@@ -3351,7 +3330,6 @@ class MoleculeApp:
     def _sp_hydrogen_dirs(self, cc_vectors, ring_normal, num_h):
         """sp碳的氢原子方向（线性几何，180°）"""
         import numpy as np
-        import math
 
         if not cc_vectors:
             return [np.array([1.0, 0.0, 0.0])][:num_h]
@@ -4619,7 +4597,7 @@ class MoleculeApp:
             indices = list(range(len(self.current_isomers)))
             label = f"共 {len(indices)} 个异构体"
 
-        mol_type = self.current_molecule_type
+        self.current_molecule_type
         n_carbon = self.current_carbon_count
 
         mol_names = MOL_NAMES_EN
@@ -4652,6 +4630,13 @@ class MoleculeApp:
         self.status_var.set("正在保存...")
         self.progress_var.set(0)
         self.progress_label.config(text="正在保存...")
+
+        # 导出前重读 Gaussian 配置：允许用户直接编辑 JSON 后立即生效
+        try:
+            self._gjf_settings = load_gjf_settings()
+        except Exception:
+            pass
+        self._gjf_warn_cache = set()
 
         # 在后台线程中保存
         thread = threading.Thread(
@@ -4705,10 +4690,7 @@ class MoleculeApp:
                             adj = self.alkene_visualizer.canon_to_adjacency(isomer_data)
                         else:
                             adj = self.alkane_generator.canon_to_adjacency(isomer_data)
-                        G = nx.Graph()
-                        for node, neighbors in adj.items():
-                            for neighbor in neighbors:
-                                G.add_edge(node, neighbor)
+                        G = _graph_from_adjacency(adj, mol_type)
                         graph_data = pickle.dumps(G)
                     except Exception:
                         graph_data = pickle.dumps(isomer_data)
@@ -4775,20 +4757,22 @@ class MoleculeApp:
                             adj = self.alkene_visualizer.canon_to_adjacency(isomer_data)
                         else:
                             adj = self.alkane_generator.canon_to_adjacency(isomer_data)
-                        G = nx.Graph()
-                        for node, neighbors in adj.items():
-                            for neighbor in neighbors:
-                                G.add_edge(node, neighbor)
+                        G = _graph_from_adjacency(adj, mol_type)
                     except Exception:
                         G = None
                 else:
                     G = None
-                content = self._generate_gjf_content(G, c_coords, h_coords, mol_type, n_carbon, i + 1)
 
                 # 写文件（使用原始编号保持与坐标一致）
                 filename = f"{formulas[mol_type]}_{mol_names.get(mol_type, mol_type)}_{i + 1:03d}.gjf"
                 filepath = save_folder / filename
-                with open(filepath, 'w', encoding='utf-8') as f:
+
+                # %Chk 与 .gjf 同名（去扩展名），便于 formchk / cubegen 与 restart
+                content = self._generate_gjf_content(
+                    G, c_coords, h_coords, mol_type, n_carbon, i + 1,
+                    chk_name=filename[:-4],
+                )
+                with open(filepath, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(content)
 
                 progress = int((idx_in_filtered + 1) / total * 25) + 75
@@ -4805,109 +4789,200 @@ class MoleculeApp:
             if not self.window_closed:
                 self.root.after(0, messagebox.showerror, "保存错误", str(e))
 
-    def _generate_isomer_content(self, isomer_data, mol_type, n_carbon, index):
-        """生成单个异构体的 Gaussian .gjf 格式内容"""
-        import networkx as nx
+    # ------------------------------------------------------------------
+    # Gaussian .gjf 导出配置
+    # ------------------------------------------------------------------
 
-        # 处理规范字符串格式（烷烃返回字符串，其他可能返回图对象）
-        G = isomer_data
-        adj = None
-        if isinstance(isomer_data, str):
-            # 规范字符串转换为图对象
+    def _get_gjf_settings(self):
+        """取当前 Gaussian 导出配置（懒加载并缓存）。
+
+        配置持久化在 ``~/.hydrocarbon_generator/gaussian_export.json``
+        （可用环境变量 ``HYDROCARBON_GJF_CONFIG`` 覆盖路径）；读写失败一律
+        回落到默认值，绝不阻断导出。
+        """
+        cached = getattr(self, '_gjf_settings', None)
+        if cached is None:
             try:
-                if mol_type == 'alkene':
-                    # 烯烃使用特殊的转换（带双键信息）
-                    adj = self.alkene_visualizer.canon_to_adjacency(isomer_data)
-                else:
-                    # 烷烃使用标准转换
-                    adj = self.alkane_generator.canon_to_adjacency(isomer_data)
-                G = nx.Graph()
-                for node, neighbors in adj.items():
-                    for neighbor in neighbors:
-                        G.add_edge(node, neighbor)
-            except Exception as e:
-                return f"错误：无法解析异构体 #{index} 的结构\n{e}"
+                cached = load_gjf_settings()
+            except Exception:
+                cached = GjfSettings()
+            self._gjf_settings = cached
+        return cached
 
-        # 确保 G 是图对象
-        if not isinstance(G, nx.Graph):
-            return f"错误：异构体 #{index} 的数据结构无效 (类型: {type(isomer_data).__name__})"
+    def _log_gjf_warnings(self, result, index):
+        """把连通性降级等警告打到控制台；同类警告只报一次，避免刷屏。"""
+        warnings = getattr(result, 'warnings', None)
+        if not warnings:
+            return
+        cache = getattr(self, '_gjf_warn_cache', None)
+        if cache is None:
+            cache = set()
+            self._gjf_warn_cache = cache
+        for w in warnings:
+            key = w.split('；')[0][:60]
+            if key not in cache:
+                cache.add(key)
+                print(f"[GJF] 异构体 #{index}: {w}")
 
-        # 分子式
-        formulas = {mt: compute_formula(mt, n_carbon, getattr(self, '_current_n_hydrogen', None)) for mt in MOL_NAMES_EN}
+    def _open_gjf_settings_dialog(self):
+        """Gaussian 导出设置对话框：方法/基组、电荷/多重度、Link 0、连通性开关。"""
+        try:
+            current = self._get_gjf_settings()
+        except Exception:
+            current = GjfSettings()
 
-        mol_names = MOL_NAMES_EN
+        win = tk.Toplevel(self.root)
+        win.title("Gaussian 导出设置")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
 
-        # 计算坐标
-        c_coords, h_coords = self._calculate_molecule_coords(isomer_data, mol_type, n_carbon)
+        frame = ttk.Frame(win, padding=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
 
-        # 缩放键长至真实值（包括C-H键长，Compute2DCoords默认C-H距离~1.5Å，GaussView无法识别）
-        # GaussView根据原子间距离判断键级，MMFF优化后双键距离偏长(~1.45A)会被误判为单键
-        if mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
-            c_coords, h_coords = self._scale_multi_bond_distances(G, c_coords, h_coords)
+        ttk.Label(frame, text="Gaussian 输入卡（.gjf）导出设置",
+                  font=('Microsoft YaHei', 13, 'bold'),
+                  foreground='#1a3a5c').grid(row=0, column=0, columnspan=2,
+                                             sticky='w', pady=(0, 4))
+        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(
+            row=1, column=0, columnspan=2, sticky='ew', pady=(0, 10))
 
-        # ========== 生成 Gaussian .gjf 格式 ==========
-        lines = []
+        vars_ = {
+            'charge': tk.StringVar(value=str(current.charge)),
+            'multiplicity': tk.StringVar(value=str(current.multiplicity)),
+            'route': tk.StringVar(value=current.route_keywords),
+            'mem': tk.StringVar(value=current.mem),
+            'nproc': tk.StringVar(value=str(current.nproc)),
+        }
+        flags = {
+            'write_chk': tk.BooleanVar(value=current.write_chk),
+            'use_connectivity': tk.BooleanVar(value=current.use_connectivity),
+            'verbose_route': tk.BooleanVar(value=current.verbose_route),
+        }
 
-        # 1. 文件头注释（三行，避免 GaussView 报错）
-        lines.append(f"# {formulas[mol_type]} {mol_names[mol_type]} Isomer #{index}")
-        lines.append("")
-        lines.append(f"# {formulas[mol_type]} {mol_names[mol_type]} - Isomer #{index}")
-        lines.append("# Generated by Molecule Isomer Visualizer")
-        lines.append("")
-        lines.append("0 1")  # 电荷=0, 自旋多重度=1
+        fields = [
+            ('电荷 charge', 'charge'),
+            ('自旋多重度 multiplicity', 'multiplicity'),
+            ('方法 / 基组 / 任务', 'route'),
+            ('内存 %Mem', 'mem'),
+            ('核数 %NProcShared', 'nproc'),
+        ]
+        for i, (label, key) in enumerate(fields, start=2):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky='w',
+                                              pady=3, padx=(0, 10))
+            ttk.Entry(frame, textvariable=vars_[key], width=36).grid(
+                row=i, column=1, sticky='ew', pady=3)
 
-        # 2. 碳原子坐标
-        for i in range(G.number_of_nodes()):
-            if i in c_coords:
-                coord = c_coords[i]
-                lines.append(f"C     {coord[0]:>12.6f} {coord[1]:>12.6f} {coord[2]:>12.6f}")
+        ttk.Label(
+            frame,
+            text=("提示：中性闭壳层分子填 0 与 1；自由基 0 与 2；阳离子 1 与 1、阴离子 -1 与 1。\n"
+                  "方法/基组不含前导 #，例：B3LYP/6-31G(d) Opt"),
+            style='Info.TLabel', justify=tk.LEFT, wraplength=380
+        ).grid(row=7, column=0, columnspan=2, sticky='w', pady=(6, 4))
 
-        # 3. 氢原子坐标
-        for coord in h_coords:
-            lines.append(f"H     {coord[0]:>12.6f} {coord[1]:>12.6f} {coord[2]:>12.6f}")
+        opt_row = 8
+        for label, key in (("写入 %Chk（可 restart / formchk / cubegen）", 'write_chk'),
+                           ("输出连通性块（Geom=Connectivity，保留键级）", 'use_connectivity'),
+                           ("route 使用 #p（详细输出）", 'verbose_route')):
+            ttk.Checkbutton(frame, text=label, variable=flags[key]).grid(
+                row=opt_row, column=0, columnspan=2, sticky='w')
+            opt_row += 1
 
-        # 4. 对于含双键的类型，添加键连接信息（GaussView 依赖此信息识别键级）
-        if mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
-            lines.append("")
-            n_c = G.number_of_nodes()
-            # 收集C-C键信息
-            bond_lines = []
-            for u, v, data in G.edges(data=True):
-                bond_type = data.get('bond_type', 'single')
-                if bond_type == 'double':
-                    bond_order = 2
-                elif bond_type == 'triple':
-                    bond_order = 3
-                else:
-                    bond_order = 1
-                bond_lines.append(f"{u+1:4d} {v+1:4d} {bond_order:4d} 0.0 0.0 0.0")
+        # 实时预览 route 段，避免用户填错却到提交时才报错
+        preview_var = tk.StringVar(value="")
+        ttk.Label(frame, text="route 预览：").grid(row=opt_row, column=0,
+                                                  sticky='nw', pady=(10, 0))
+        preview_lbl = ttk.Label(frame, textvariable=preview_var,
+                                foreground='#1a3a5c', wraplength=330,
+                                justify=tk.LEFT)
+        preview_lbl.grid(row=opt_row, column=1, sticky='w', pady=(10, 0))
 
-            # 添加C-H键信息，使GaussView能正确显示所有氢原子连接
-            h_global_idx = n_c + 1  # 氢原子在GJF中的1-based全局索引
-            for c_idx in range(n_c):
-                # 计算该碳原子的氢原子数
-                bond_load = 0
-                for nb in G.neighbors(c_idx):
-                    bt = G[c_idx][nb].get('bond_type', 'single')
-                    if bt == 'double':
-                        bond_load += 2
-                    elif bt == 'triple':
-                        bond_load += 3
-                    else:
-                        bond_load += 1
-                h_count = 4 - bond_load
-                for _ in range(max(0, h_count)):
-                    bond_lines.append(f"{c_idx+1:4d} {h_global_idx:4d}    1 0.0 0.0 0.0")
-                    h_global_idx += 1
+        def _refresh_preview(*_args):
+            try:
+                s = GjfSettings(
+                    route_keywords=vars_['route'].get(),
+                    mem=vars_['mem'].get(),
+                    nproc=int(vars_['nproc'].get()),
+                    charge=int(vars_['charge'].get()),
+                    multiplicity=int(vars_['multiplicity'].get()),
+                    write_chk=flags['write_chk'].get(),
+                    use_connectivity=flags['use_connectivity'].get(),
+                    verbose_route=flags['verbose_route'].get(),
+                ).normalized()
+                preview_var.set(
+                    compose_route_line(s, bool(flags['use_connectivity'].get()))
+                    + f"\n（内存 {s.mem}，核数 {s.nproc}，电荷/多重度 {s.charge} {s.multiplicity}）"
+                )
+            except Exception:
+                preview_var.set("（当前输入无法解析，请检查数值字段）")
 
-            lines.extend(bond_lines)
+        for var in list(vars_.values()):
+            var.trace_add('write', _refresh_preview)
+        for var in list(flags.values()):
+            var.trace_add('write', _refresh_preview)
+        _refresh_preview()
 
-        lines.append("")
+        def _on_ok():
+            try:
+                nproc = int(vars_['nproc'].get())
+                charge = int(vars_['charge'].get())
+                mult = int(vars_['multiplicity'].get())
+            except ValueError:
+                messagebox.showerror("输入无效", "电荷、自旋多重度、核数必须是整数。")
+                return
+            if mult < 1:
+                messagebox.showerror("输入无效", "自旋多重度必须 ≥ 1。")
+                return
+            if nproc < 1:
+                messagebox.showerror("输入无效", "核数必须 ≥ 1。")
+                return
+            new_cfg = GjfSettings(
+                route_keywords=vars_['route'].get(),
+                mem=vars_['mem'].get(),
+                nproc=nproc,
+                charge=charge,
+                multiplicity=mult,
+                write_chk=flags['write_chk'].get(),
+                use_connectivity=flags['use_connectivity'].get(),
+                verbose_route=flags['verbose_route'].get(),
+            ).normalized()
+            self._gjf_settings = new_cfg
+            saved = False
+            try:
+                saved = save_gjf_settings(new_cfg)
+            except Exception:
+                saved = False
+            if not saved:
+                messagebox.showwarning(
+                    "配置未持久化",
+                    "设置已在本次运行生效，但写入配置文件失败：\n"
+                    f"{gjf_settings_path()}\n如需长期保存请检查该路径权限。")
+            win.destroy()
 
-        return "\n".join(lines)
+        btn_row = opt_row + 1
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=btn_row, column=0, columnspan=2, pady=(14, 0), sticky='e')
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="保存", style='Action.TButton',
+                   command=_on_ok).pack(side=tk.RIGHT)
 
-    def _generate_gjf_content(self, G, c_coords, h_coords, mol_type, n_carbon, index):
-        """使用预计算坐标生成 .gjf 文件内容（用于并行导出）"""
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+
+
+    def _generate_gjf_content(self, G, c_coords, h_coords, mol_type, n_carbon, index,
+                              chk_name=None):
+        """使用预计算坐标生成 .gjf 文件内容（用于并行导出）
+
+        实际格式由 ``gaussian_export.build_gjf`` 负责（唯一出口）；本方法只做
+        「坐标准备 + 标题组装」两件事。
+        """
         formulas = {mt: compute_formula(mt, n_carbon, getattr(self, '_current_n_hydrogen', None)) for mt in MOL_NAMES_EN}
         mol_names = MOL_NAMES_EN
 
@@ -4915,209 +4990,37 @@ class MoleculeApp:
         if G is not None and mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
             c_coords, h_coords = self._scale_multi_bond_distances(G, c_coords, h_coords)
 
-        lines = []
-        lines.append(f"# {formulas[mol_type]} {mol_names[mol_type]} Isomer #{index}")
-        lines.append("")
-        lines.append(f"# {formulas[mol_type]} {mol_names[mol_type]} - Isomer #{index}")
-        lines.append("# Generated by Molecule Isomer Visualizer")
-        lines.append("")
-        lines.append("0 1")
-
-        # 碳原子坐标（按节点索引0,1,2,...顺序）
-        if c_coords:
-            n_nodes = max(c_coords.keys()) + 1
-            for i in range(n_nodes):
-                if i in c_coords:
-                    coord = c_coords[i]
-                    lines.append(f"C     {coord[0]:>12.6f} {coord[1]:>12.6f} {coord[2]:>12.6f}")
-        elif G is not None:
-            # RDKit嵌入失败：使用2D投影作为回退坐标，确保GJF有有效坐标
+        # RDKit 嵌入失败时的 2D 投影回退：保证 .gjf 始终有有效坐标
+        if not c_coords and G is not None:
             import math
+            h_coords = list(h_coords or [])
             n_nodes = G.number_of_nodes()
-            for i in range(n_nodes):
-                angle = 2 * math.pi * i / n_nodes
-                x = 1.5 * math.cos(angle)
-                y = 1.5 * math.sin(angle)
-                lines.append(f"C     {x:>12.6f} {y:>12.6f}    0.000000")
             c_coords = {i: (1.5 * math.cos(2 * math.pi * i / n_nodes),
                             1.5 * math.sin(2 * math.pi * i / n_nodes),
                             0.0) for i in range(n_nodes)}
-            # 生成氢原子坐标回退
             for node in sorted(G.nodes()):
                 bond_load = 0
                 for nb in G.neighbors(node):
                     bt = G[node][nb].get('bond_type', 'single')
-                    bond_load += 2 if bt == 'double' else 1
-                h_count = 4 - bond_load
+                    bond_load += 2 if bt == 'double' else (3 if bt == 'triple' else 1)
+                h_count = max(0, 4 - bond_load)
                 cx, cy, cz = c_coords[node]
-                for j in range(max(0, h_count)):
+                for j in range(h_count):
                     ha = 2 * math.pi * j / max(h_count, 1) + node * 0.5
-                    hx = cx + 1.09 * math.cos(ha)
-                    hy = cy + 1.09 * math.sin(ha)
-                    h_coords.append((hx, hy, cz))
+                    h_coords.append((cx + 1.09 * math.cos(ha),
+                                     cy + 1.09 * math.sin(ha), cz))
 
-        # 氢原子坐标
-        for coord in h_coords:
-            lines.append(f"H     {coord[0]:>12.6f} {coord[1]:>12.6f} {coord[2]:>12.6f}")
+        title = f"{formulas[mol_type]} {mol_names[mol_type]} Isomer #{index}"
+        if chk_name is None:
+            chk_name = f"{formulas[mol_type]}_{mol_names[mol_type]}_{index:03d}"
+        result = build_gjf(
+            title, c_coords, h_coords, G,
+            settings=self._get_gjf_settings(),
+            chk_name=chk_name,
+        )
+        self._log_gjf_warnings(result, index)
+        return result.text
 
-        # 键连接信息（含多重键的分子需要）
-        has_valid_coords = bool(c_coords) and any(
-            abs(c[0]) > 0.001 or abs(c[1]) > 0.001 or abs(c[2]) > 0.001
-            for c in c_coords.values()
-        ) if c_coords else False
-        if G is not None and has_valid_coords and mol_type in ('cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
-            lines.append("")
-            n_c = G.number_of_nodes()
-            bond_lines = []
-            for u, v, data in G.edges(data=True):
-                bt = data.get('bond_type', 'single')
-                if bt == 'double':
-                    bo = 2
-                elif bt == 'triple':
-                    bo = 3
-                else:
-                    bo = 1
-                bond_lines.append(f"{u+1:4d} {v+1:4d} {bo:4d} 0.0 0.0 0.0")
-
-            h_global_idx = n_c + 1
-            for c_idx in range(n_c):
-                bond_load = 0
-                for nb in G.neighbors(c_idx):
-                    bt = G[c_idx][nb].get('bond_type', 'single')
-                    if bt == 'double':
-                        bond_load += 2
-                    elif bt == 'triple':
-                        bond_load += 3
-                    else:
-                        bond_load += 1
-                h_count = 4 - bond_load
-                for _ in range(max(0, h_count)):
-                    bond_lines.append(f"{c_idx+1:4d} {h_global_idx:4d}    1 0.0 0.0 0.0")
-                    h_global_idx += 1
-
-            lines.extend(bond_lines)
-
-        lines.append("")
-        return "\n".join(lines)
-
-    def _calculate_molecule_coords(self, isomer_data, mol_type=None, n_carbon=None):
-        """计算分子的坐标信息
-        
-        支持两种调用方式:
-        1. isomer_data 为元组 (mol_type, data) - 新格式
-        2. mol_type 单独传入 - 旧格式兼容
-        """
-        if mol_type is None and isinstance(isomer_data, tuple) and len(isomer_data) == 2:
-            mol_type, isomer_data = isomer_data
-        import networkx as nx
-        import numpy as np
-
-        c_coords = {}
-        h_coords = []
-        adj = None
-
-        # 处理规范字符串格式（烷烃返回字符串，其他可能返回图对象）
-        G = isomer_data
-        if isinstance(isomer_data, str):
-            # 规范字符串转换为邻接表和图对象
-            try:
-                if mol_type == 'alkene':
-                    # 烯烃使用特殊的转换（带双键信息）
-                    adj = self.alkene_visualizer.canon_to_adjacency(isomer_data)
-                else:
-                    # 烷烃使用标准转换
-                    adj = self.alkane_generator.canon_to_adjacency(isomer_data)
-                G = nx.Graph()
-                for node, neighbors in adj.items():
-                    for neighbor in neighbors:
-                        G.add_edge(node, neighbor)
-            except Exception:
-                return c_coords, h_coords
-
-        # 确保 G 是图对象
-        if not isinstance(G, nx.Graph):
-            return c_coords, h_coords
-
-        try:
-            if mol_type == 'alkane':
-                # 烷烃使用 RDKit 生成高质量3D坐标（单键）
-                if adj is None:
-                    adj = self.alkane_generator.canon_to_adjacency(isomer_data)
-                return _rdkit_coords_single(G)
-
-            elif mol_type == 'alkyne':
-                # 使用炔烃可视化器
-                coords = self.alkyne_visualizer._calculate_coordinates(G)
-                hydrogens = self.alkyne_visualizer._generate_hydrogen_coords(G, coords)
-                return coords, hydrogens
-
-            elif mol_type == 'alkene':
-                # 烯烃使用 RDKit 生成高质量3D坐标（含双键）
-                return _rdkit_coords_with_bonds(G, double_only=True)
-
-            elif mol_type == 'diene':
-                # 二烯烃：使用 RDKit 生成高质量3D坐标（含双键 + 累积双键修正）
-                c_coords, h_coords = _rdkit_coords_with_bonds(G, double_only=True)
-                c_coords = self._fix_cumulated_diene_coords(G, c_coords)
-                return c_coords, h_coords
-
-            elif mol_type == 'cycloalkane':
-                # 环烷烃：使用 RDKit 生成高质量3D坐标（含力场优化）
-                c_coords_rdkit, h_coords_rdkit, h_to_c = self._build_cycloalkane_rdkit(G)
-
-                if c_coords_rdkit is not None:
-                    return c_coords_rdkit, h_coords_rdkit
-                else:
-                    # RDKit 嵌入失败，尝试 PolycycloalkaneGenerator 的多种子策略
-                    mol = self.multcycloalkane_generator.graph_to_rdkit_mol(G, optimize=True)
-                    if mol is not None and mol.GetNumConformers() > 0:
-                        conf = mol.GetConformer()
-                        c_coords = {}
-                        h_coords = []
-                        for atom in mol.GetAtoms():
-                            pos = conf.GetAtomPosition(atom.GetIdx())
-                            coord = np.array([float(pos.x), float(pos.y), float(pos.z)])
-                            if atom.GetSymbol() == 'C':
-                                c_coords[atom.GetIdx()] = coord
-                            else:
-                                h_coords.append(coord)
-                        return c_coords, h_coords
-                    # 最终回退：2D坐标
-                    c_coords = {}
-                    for node in G.nodes():
-                        angle = 2 * np.pi * node / G.number_of_nodes()
-                        c_coords[node] = np.array([np.cos(angle), np.sin(angle), 0.0])
-                    return c_coords, []
-
-            elif mol_type in ('cycloalkene', 'cyclopolyene'):
-                # 单环烯/多烯：RDKit 生成含双键3D坐标（环状自动多种子 + 累积双键修正）
-                c_coords, h_coords = _rdkit_coords_with_bonds(G, double_only=True)
-                c_coords = self._fix_cumulated_diene_coords(G, c_coords)
-                return c_coords, h_coords
-
-            elif mol_type in ('triene', 'tetraene', 'polyene', 'alkenyl'):
-                # 多烯/烯炔：RDKit 生成含多重键3D坐标（含累积双键修正）
-                c_coords, h_coords = _rdkit_coords_with_bonds(G, double_only=(mol_type != 'alkenyl'))
-                # RDKit/MMFF会将累积双键优化为180°共线，导致GaussView误判为三键
-                # 将共线碳的角度修正为~120°(sp杂化碳的实际合理键角)
-                c_coords = self._fix_cumulated_diene_coords(G, c_coords)
-                return c_coords, h_coords
-
-            elif mol_type == 'multcycloalkane':
-                # 多环烷烃：RDKit 生成全单键3D坐标（环状自动多种子）
-                return _rdkit_coords_with_bonds(G, double_only=True)
-
-            elif mol_type == 'multcyclomultalkane':
-                # 多环多烯炔烃：RDKit 生成含多重键3D坐标（含累积双键修正）
-                c_coords, h_coords = _rdkit_coords_with_bonds(G, double_only=False)
-                c_coords = self._fix_cumulated_diene_coords(G, c_coords)
-                return c_coords, h_coords
-
-        except Exception as e:
-            import traceback
-            print(f"【坐标计算异常】{mol_type} C{n_carbon}: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            return c_coords, h_coords
 
     def _save_complete(self, save_folder, total):
         """保存完成"""
@@ -5130,7 +5033,6 @@ class MoleculeApp:
         """可视化单个单环烯烃异构体（使用 RDKit 生成高质量3D坐标）"""
         try:
             import networkx as nx
-            from rdkit import Chem
             from rdkit.Chem import AllChem
 
             n_carbons = G.number_of_nodes()
@@ -5180,7 +5082,7 @@ class MoleculeApp:
                                 length = np.linalg.norm(direction)
                                 if length > 1e-8:
                                     # 垂直方向（在分子所在平面内偏移）
-                                    mid = (p1 + p2) / 2
+                                    (p1 + p2) / 2
                                     up = np.array([0, 0, 1])
                                     perp = np.cross(direction, up)
                                     perp_norm = np.linalg.norm(perp)
@@ -5258,7 +5160,6 @@ class MoleculeApp:
                 for h_idx, c_idx in h_to_c.items():
                     if h_idx - n_carbons < len(h_coords) and c_idx in c_coords:
                         # 氢原子在RDKit中的索引大于碳原子
-                        h_pos_idx = None
                         h_count = 0
                         for atom in mol.GetAtoms():
                             if atom.GetIdx() == h_idx:
@@ -5298,10 +5199,9 @@ class MoleculeApp:
         try:
             import networkx as nx
             import numpy as np
-            from rdkit import Chem
             from rdkit.Chem import AllChem
 
-            n_carbons = G.number_of_nodes()
+            G.number_of_nodes()
 
             # 从图中提取双键边信息
             double_bond_edges = set()
@@ -5511,10 +5411,9 @@ class MoleculeApp:
     def _visualize_alkenyl(self, G, title):
         """可视化单个烯炔烃异构体（含双键+三键，使用RDKit 3D坐标 + matplotlib）"""
         try:
-            import networkx as nx
             import numpy as np
 
-            n_carbons = G.number_of_nodes()
+            G.number_of_nodes()
 
             # 从图中提取键类型信息
             double_bond_edges = set()
@@ -5698,10 +5597,9 @@ class MoleculeApp:
     def _visualize_polyene(self, G, title):
         """可视化单个多烯烃异构体（含多个双键，使用RDKit 3D坐标 + matplotlib）"""
         try:
-            import networkx as nx
             import numpy as np
 
-            n_carbons = G.number_of_nodes()
+            G.number_of_nodes()
 
             # 收集双键信息
             double_bond_edges = set()
@@ -5841,7 +5739,6 @@ class MoleculeApp:
             - h_to_c: {氢原子列表索引: 对应的碳原子索引}
         """
         try:
-            from rdkit import Chem
             from rdkit.Chem import AllChem
 
             # 环烷烃全单键：多种子嵌入，失败回退2D坐标
@@ -5963,11 +5860,10 @@ class MoleculeApp:
     def _visualize_multcycloalkane(self, G, title):
         """可视化多环烷烃异构体（优先使用 RDKit 构建高质量3D坐标）"""
         try:
-            import math
             import networkx as nx
             from rdkit.Chem import AllChem
 
-            n_carbons = G.number_of_nodes()
+            G.number_of_nodes()
 
             # 构建 RDKit 全单键分子 + 多种子3D嵌入（失败回退2D）
             mol = _build_rdkit_mol(G, single_only=True)
@@ -5995,7 +5891,7 @@ class MoleculeApp:
             ring_edges = set()
             for ci, cycle in enumerate(cycles):
                 color = ring_colors[ci % len(ring_colors)]
-                cycle_set = set(cycle)
+                set(cycle)
                 for node in cycle:
                     if node not in node_ring_color:
                         node_ring_color[node] = color
@@ -6098,151 +5994,7 @@ class MoleculeApp:
         except Exception as e:
             messagebox.showerror("可视化错误", f"多环烷烃可视化失败: {str(e)}")
 
-    def _visualize_alkynes_batch(self, graphs, title):
-        """批量可视化炔烃异构体"""
-        n = len(graphs)
-        if n > 20:
-            n_display = 20
-            messagebox.showinfo("提示", f"共有 {n} 个异构体，将显示前 20 个")
-        else:
-            n_display = n
 
-        cols = min(4, n_display)
-        rows = (n_display + cols - 1) // cols
-
-        fig = plt.figure(figsize=(4 * cols, 4 * rows))
-        fig.suptitle(title, fontsize=14, fontweight='bold')
-
-        for i in range(n_display):
-            ax = fig.add_subplot(rows, cols, i + 1, projection='3d')
-            G = graphs[i]
-
-            try:
-                # 获取三键信息
-                triple_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get('bond_type') == 'triple']
-
-                # 计算坐标
-                coords = self.alkyne_visualizer._calculate_coordinates(G)
-                if not coords:
-                    continue
-
-                # 生成氢原子
-                h_coords = self.alkyne_visualizer._generate_hydrogen_coords(G, coords)
-
-                # 绘制分子
-                self.alkyne_visualizer._draw_molecule(ax, G, coords, h_coords, triple_edges)
-
-                # 设置标题
-                if triple_edges:
-                    u, v = triple_edges[0]
-                    ax.set_title(f"C{u+1}≡C{v+1}", fontsize=10, pad=10)
-                else:
-                    ax.set_title(f"#{i+1}", fontsize=10, pad=10)
-
-                # 设置等比例
-                all_coords = list(coords.values()) + h_coords
-                self.alkyne_visualizer._set_equal_aspect_ratio(ax, all_coords)
-
-            except Exception as e:
-                ax.set_title(f"#{i+1} (error)", fontsize=10)
-                ax.text(0.5, 0.5, 0.5, str(e), transform=ax.transAxes)
-
-        plt.tight_layout()
-        plt.show()
-
-    def _visualize_cycloalkanes_batch(self, graphs, title):
-        """批量可视化环烷烃异构体（优先使用 RDKit 构建高质量3D坐标）"""
-        n = len(graphs)
-        if n > 20:
-            n_display = 20
-            messagebox.showinfo("提示", f"共有 {n} 个异构体，将显示前 20 个")
-        else:
-            n_display = n
-
-        cols = min(4, n_display)
-        rows = (n_display + cols - 1) // cols
-
-        fig = plt.figure(figsize=(4 * cols, 4 * rows))
-        fig.suptitle(title, fontsize=14, fontweight='bold')
-
-        import networkx as nx
-
-        for i in range(n_display):
-            ax = fig.add_subplot(rows, cols, i + 1, projection='3d')
-            G = graphs[i]
-
-            try:
-                c_coords, h_coords, h_to_c = self._build_cycloalkane_rdkit(G)
-                if c_coords is None:
-                    # RDKit 失败，尝试 PolycycloalkaneGenerator 的多种子策略
-                    mol = self.multcycloalkane_generator.graph_to_rdkit_mol(G, optimize=True)
-                    if mol is not None and mol.GetNumConformers() > 0:
-                        conf = mol.GetConformer()
-                        c_coords = {}
-                        h_coords = []
-                        h_to_c = {}
-                        for atom in mol.GetAtoms():
-                            pos = conf.GetAtomPosition(atom.GetIdx())
-                            coord = [float(pos.x), float(pos.y), float(pos.z)]
-                            if atom.GetSymbol() == 'C':
-                                c_coords[atom.GetIdx()] = coord
-                            else:
-                                h_to_c[len(h_coords)] = next((a.GetIdx() for a in atom.GetNeighbors() if a.GetSymbol() == 'C'), 0)
-                                h_coords.append(coord)
-                    else:
-                        import math
-                        c_coords = {}
-                        n_nodes = G.number_of_nodes()
-                        for node in G.nodes():
-                            angle = 2 * math.pi * node / n_nodes
-                            c_coords[node] = [math.cos(angle), math.sin(angle), 0.0]
-                        h_coords = []
-                        h_to_c = {}
-
-                ring_set = set(nx.cycle_basis(G)[0])
-
-                # 绘制C-C键
-                drawn_bonds = set()
-                for node in G.nodes():
-                    for neighbor in G.neighbors(node):
-                        bond_key = tuple(sorted([node, neighbor]))
-                        if bond_key not in drawn_bonds:
-                            if node in c_coords and neighbor in c_coords:
-                                ax.plot(
-                                    [c_coords[node][0], c_coords[neighbor][0]],
-                                    [c_coords[node][1], c_coords[neighbor][1]],
-                                    [c_coords[node][2], c_coords[neighbor][2]],
-                                    'k-', linewidth=1.5
-                                )
-                            drawn_bonds.add(bond_key)
-
-                # 绘制碳原子（环碳用红色）
-                for n in sorted(c_coords.keys()):
-                    color = 'red' if n in ring_set else 'black'
-                    ax.scatter([c_coords[n][0]], [c_coords[n][1]], [c_coords[n][2]],
-                               c=color, s=80, zorder=5)
-
-                # 绘制氢原子
-                for i2, h_coord in enumerate(h_coords):
-                    ax.scatter([h_coord[0]], [h_coord[1]], [h_coord[2]],
-                              c='white', edgecolors='gray', s=40, zorder=5)
-
-                ax.set_title(f"#{i+1}", fontsize=10)
-
-            except Exception:
-                # 回退方案：使用简单的2D表示
-                pos = nx.spring_layout(G, seed=42)
-                for node in G.nodes():
-                    x, y = pos[node]
-                    ax.scatter([x], [y], [0], c='black', s=50)
-                for u, v in G.edges():
-                    x1, y1 = pos[u]
-                    x2, y2 = pos[v]
-                    ax.plot([x1, x2], [y1, y2], [0, 0], 'k-', linewidth=1)
-                ax.set_title(f"#{i+1} (fallback)", fontsize=10)
-
-        plt.tight_layout()
-        plt.show()
 
     def _show_error(self, error_msg):
         """显示错误信息"""
@@ -6250,7 +6002,6 @@ class MoleculeApp:
             return
 
         try:
-            self.is_generating = False
             self.generate_btn.config(state=tk.NORMAL)
             self.cancel_btn.config(state=tk.DISABLED)
             self.progress_var.set(0)

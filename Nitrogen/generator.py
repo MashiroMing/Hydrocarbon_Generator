@@ -31,12 +31,12 @@ atomic_matrix_n.py 预言机（完备枚举）兜底，validate.py 负责
 
 import networkx as nx
 from itertools import combinations
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Callable
 from collections import defaultdict
 
 from .formula import (graph_formula_parts, format_graph_formula,
-                      formula_matches_input, dbe_from_graph)
-from .atomic_matrix_n import AtomicMatrixNGenerator, _seen_add, _graphs_isomorphic
+                      dbe_from_graph, is_valence_legal)
+from .atomic_matrix_n import AtomicMatrixNGenerator, _graphs_isomorphic
 
 
 # ============ 节点/边工具 ============
@@ -248,7 +248,18 @@ class NitrogenGenerator:
         seen: Dict[str, List[nx.Graph]] = {}
 
         def add(g: nx.Graph) -> bool:
-            """公式门禁前置 + 碰撞安全去重；返回 True 表示新结构入桶"""
+            """价态 + 公式门禁前置 + 碰撞安全去重；返回 True 表示新结构入桶
+
+            ⚠ 价态门禁不可移除（红线 §8.4-1 的 N 系对应）：
+              公式门禁单独**不足以**拦截超价原子——graph_formula_parts 用
+              `h = max(0, max_v − bond_load)` 计算氢数，会把"超价"静默吸收成
+              h = 0，于是 N 载 4 键这类非法结构仍可能凑出目标 H 而蒙混过关。
+              历史缺陷实证：机制 A 对键载为 4 的碳做 C→N 替换会产生 N 超价结构
+              （C2H6N2 多 1 个、C2H4N2 多 5 个），全部通过了纯公式门禁。
+              故此处**先**做价态硬校验（C ≤ 4、N ≤ 3），再由公式门禁收口。
+            """
+            if not is_valence_legal(g):
+                return False
             n_c, n_h, n_n = graph_formula_parts(g)
             if n_c != n_carbon or n_n != n_nitrogen or n_h not in target_h_set:
                 return False
@@ -275,20 +286,25 @@ class NitrogenGenerator:
             _mechanism_replace(skel_full, n_nitrogen, add)
 
         # 机制 B：端基 N（骨架 = nC 全碳）
+        # ⚠ 机制 B/C 的 k_target 由 n_hydrogen 决定（delta = k_target − k_skel），
+        #   因此必须对 target_h_set 中的**每一个 H 档位**各调用一次。
+        #   历史缺陷：原实现只传 min(target_h_set)（= 最高不饱和度那一档），
+        #   导致 n_hydrogen=None（文档承诺"枚举全部 H"）时 B/C 只产出极少数结构；
+        #   默认配置下被机制 A 的完备性掩盖，仅在 enable_replace=False 时暴露。
         if self.enable_terminal:
             skel_nc = self._skeletons(n_carbon)
             if progress_cb:
                 progress_cb('terminal', len(skel_nc))
-            _mechanism_terminal(skel_nc, n_nitrogen, n_carbon,
-                                min(target_h_set) if target_h_set else 0, add)
+            for tgt_h in sorted(target_h_set):
+                _mechanism_terminal(skel_nc, n_nitrogen, n_carbon, tgt_h, add)
 
         # 机制 C：桥 N（骨架 = nC 全碳）
         if self.enable_bridge:
             skel_nc = self._skeletons(n_carbon)
             if progress_cb:
                 progress_cb('bridge', len(skel_nc))
-            _mechanism_bridge(skel_nc, n_nitrogen, n_carbon,
-                              min(target_h_set) if target_h_set else 0, add)
+            for tgt_h in sorted(target_h_set):
+                _mechanism_bridge(skel_nc, n_nitrogen, n_carbon, tgt_h, add)
 
         return dict(buckets)
 

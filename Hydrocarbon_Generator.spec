@@ -18,6 +18,7 @@ a = Analysis(
     datas=[
         ('original_programs', 'original_programs'),
         ('utils.py', '.'),
+        ('gaussian_export.py', '.'),
     ],
     hiddenimports=[
         # RDKit（pip 版 rdkit 需显式声明子模块）
@@ -46,15 +47,15 @@ a = Analysis(
         'original_programs.alkene_visualizer',
         'original_programs.alkene',
         'original_programs.alkyne',
-        'original_programs.alkenyl_generator',
-        'original_programs.polyene_generator',
+        # 注：alkenyl_generator / polyene_generator / cycloalkene_generator 为
+        # 独立 CLI 模块（供命令行测试用），不属于 GUI 调用链，故不列入打包
         'original_programs.multcycloalkane',
         'original_programs.multcyclomultalkane',
-        'original_programs.cycloalkene_generator',
         'original_programs.cyclopolyene_generator',
         'original_programs.polyalkenyne',
         'utils',
         'molecular_constants',
+        'gaussian_export',
         # 卤素/含氧模块包
         'halogen.Halide',
         'oxygen.oxo_generator',
