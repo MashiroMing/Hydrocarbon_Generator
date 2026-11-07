@@ -1457,9 +1457,18 @@ class MoleculeApp:
             pass
 
     def _stream_show(self, n):
-        """主线程：更新状态/进度文字（不触碰列表，避免与最终填充冲突）"""
+        """主线程：更新状态/进度文字（不触碰列表，避免与最终填充冲突）
+
+        ⚠ 仅在**生成进行中**（生成按钮为 disabled）时更新：生成结束后不再覆盖
+        最终状态栏（否则会显示成"计算中... 已发现 N 个结构"）。
+        """
         try:
             if self.window_closed:
+                return
+            try:
+                if str(self.generate_btn['state']) == 'normal':
+                    return          # 已生成完毕 → 保留最终状态文字
+            except tk.TclError:
                 return
             self.status_var.set(f"计算中... 已发现 {n} 个结构（持续追加）")
             self.progress_label.config(text=f"已发现 {n} 个结构...")
@@ -1467,9 +1476,9 @@ class MoleculeApp:
             pass
 
     def _stream_flush(self):
-        """生成结束：把最终数量刷到界面"""
+        """生成结束：把最终数量刷到界面（经由主线程，禁止跨线程操作 Tk）"""
         try:
-            self._stream_show(self._stream_n)
+            self.root.after(0, self._stream_show, self._stream_n)
         except Exception:
             pass
 
@@ -1869,7 +1878,10 @@ class MoleculeApp:
 
         # ── 含氮：重原子上限预检 + 耗时确认（§13.2-Step3 约定）──
         #   路线 A（2026-09-21）起含氮可带 O → 重原子数 = nC + nN + nO
-        if n_nitrogen > 0:
+        #   ⚠ 基团构建模式（_group_counts 非空）**不走**这两项：它不枚举完整空间，
+        #     成本取决于母体骨架而非目标总重原子数（§17 修复：此前会多弹一次
+        #     "完整枚举耗时提示"并白等估算探测）。
+        if n_nitrogen > 0 and not _group_counts:
             n_heavy = n_carbon + n_nitrogen + n_oxygen
             if n_heavy > _N_MAX_ATOMS:
                 messagebox.showwarning(
