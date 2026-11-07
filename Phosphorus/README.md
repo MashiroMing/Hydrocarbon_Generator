@@ -39,6 +39,12 @@ n_c, n_h, n_p = parse_formula_p('C3H9P')
 graphs = PhosphorusMatrixGenerator(n_c, n_p).generate(n_h)   # [nx.Graph, ...]
 ```
 
+## 已接入主程序（2026-11-07）
+
+在 GUI 中直接输入含磷分子式（如 `C3H9P`、`C2H5P`）即可生成，支持：
+列表 / 分子式显示 / 详情面板 / 2D 键线式 / 3D 可视化（P 橙色）/ `.gjf` 导出。
+⚠ 第一期 **P 与 O / N / 卤素 / 氘互斥**（输入会给出明确提示）；重原子数上限 10。
+
 ## 验证
 
 ```bash

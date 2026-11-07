@@ -29,6 +29,16 @@ SUPPORTED_LABELS = frozenset({'C', 'H', 'P'})
 
 _TOKEN_RE = re.compile(r'([A-Z][a-z]?)(\d*)')
 
+#: 键级字符串 ↔ 整数（图属性统一用字符串，与主程序约定一致）
+_BOND_ORDER = {'single': 1, 'double': 2, 'triple': 3}
+
+
+def bond_order(bt, default: int = 1) -> int:
+    """键级 → 整数（同时接受 1/2/3 与 'single'/'double'/'triple'）"""
+    if isinstance(bt, int):
+        return bt if bt in (1, 2, 3) else default
+    return _BOND_ORDER.get(str(bt), default)
+
 
 class FormulaError(ValueError):
     """分子式解析/构造错误"""
@@ -110,7 +120,7 @@ def graph_formula_parts_p(G: nx.Graph,
             raise FormulaError(f"不支持的原子标签：{label!r}")
         used = 0
         for nb in G.neighbors(node):
-            bt = int(G[node][nb].get('bond_type', 1))
+            bt = bond_order(G[node][nb].get('bond_type', 1))
             if bt not in (1, 2, 3):
                 raise FormulaError(f"非法键级 {bt}（{node}-{nb}）")
             used += bt

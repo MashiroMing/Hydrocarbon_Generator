@@ -84,7 +84,7 @@ def internal_boundary_report(formula: str, chem_mode: str = 'math',
     from oxygen.atomic_matrix_gen import AtomicMatrixGenerator
 
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, err, _n_n = res
+    _, nc, nh, no, halo, _, err, _n_n, _n_p = res
     if err:
         return {'formula': formula, 'error': err}
     if no <= 0:

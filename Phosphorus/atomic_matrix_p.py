@@ -25,7 +25,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
 
-from .formula import VALENCE
+from .formula import VALENCE, bond_order
+
+#: 整数键级 → 字符串（项目统一图口径）
+_BT_NAME = {1: 'single', 2: 'double', 3: 'triple'}
 
 # WL 颜色细化轮数（固定 3 轮：更多轮收益递减、成本线性增长）
 _WL_ROUNDS = 3
@@ -53,7 +56,7 @@ def _is_graph_connected(M: List[List[int]], n: int) -> bool:
 
 
 def _matrix_to_graph(M: List[List[int]], atom_types: List[str]) -> nx.Graph:
-    """邻接矩阵 → nx.Graph（节点 label / 边 bond_type 用整型 1/2/3）"""
+    """邻接矩阵 → nx.Graph（节点 label / 边 bond_type 用**字符串**，与主程序一致）"""
     n = len(atom_types)
     G = nx.Graph()
     for i in range(n):
@@ -62,7 +65,7 @@ def _matrix_to_graph(M: List[List[int]], atom_types: List[str]) -> nx.Graph:
         for j in range(i + 1, n):
             bt = M[i][j]
             if bt:
-                G.add_edge(i, j, bond_type=int(bt))
+                G.add_edge(i, j, bond_type=_BT_NAME[int(bt)])
     return G
 
 
@@ -486,5 +489,5 @@ def _graph_to_matrix(G: nx.Graph, atom_types: List[str]) -> List[List[int]]:
     M = [[0] * n for _ in range(n)]
     for a, b, d in G.edges(data=True):
         ia, ib = idx[a], idx[b]
-        M[ia][ib] = M[ib][ia] = int(d.get('bond_type', 1))
+        M[ia][ib] = M[ib][ia] = bond_order(d.get('bond_type', 1))
     return M

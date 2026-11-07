@@ -69,7 +69,7 @@ def test_attach():
     check("硝基苯：分子式 C6H5NO2",
           format_graph_formula(NB) == 'C6H5NO2', format_graph_formula(NB))
     check("硝基苯：parts = (6,5,1,2,(0,0,0,0))",
-          graph_formula_parts_full(NB) == (6, 5, 1, 2, (0, 0, 0, 0)),
+          graph_formula_parts_full(NB) == (6, 5, 1, 2, 0, (0, 0, 0, 0)),
           str(graph_formula_parts_full(NB)))
     check("硝基苯：分子式门禁通过（含 N=1/O=2）",
           formula_matches_input(NB, 6, 5, 2, n_nitrogen=1))

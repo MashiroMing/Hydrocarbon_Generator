@@ -276,6 +276,7 @@ def filter_by_expected_formula(
     n_deuterium: int = 0,
     to_graph_fn=None,
     n_nitrogen: int = 0,
+    n_phosphorus: int = 0,
 ) -> list:
     """统一分子式门禁：仅保留真实分子式 == 用户输入分子式的异构体。
 
@@ -289,7 +290,8 @@ def filter_by_expected_formula(
             用户输入解析结果（utils.parse_compound_formula 口径）。
         to_graph_fn: 可选回调 to_graph_fn(mol_type, data) -> nx.Graph | None，
                      用于将规范字符串转图（图条目跳过转换）。
-        n_nitrogen: 氮原子数（**末位关键字参数**，默认 0 → 三条既有路径行为不变）。
+        n_nitrogen: 氮原子数（末位关键字参数，默认 0 → 既有路径行为不变）。
+        n_phosphorus: 磷原子数（末位关键字参数，默认 0 → 既有路径行为不变）。
 
     Returns:
         过滤后的 [(mol_type, data), ...]，顺序与原列表一致。
@@ -306,6 +308,7 @@ def filter_by_expected_formula(
             if G is None:
                 continue
         if formula_matches_input(G, n_carbon, n_hydrogen, n_oxygen,
-                                 halogen_spec, n_deuterium, n_nitrogen):
+                                 halogen_spec, n_deuterium, n_nitrogen,
+                                 n_phosphorus):
             result.append((mol_type, data))
     return result

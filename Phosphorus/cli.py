@@ -18,6 +18,7 @@ import networkx as nx
 
 from .atomic_matrix_p import PhosphorusMatrixGenerator
 from .formula import (
+    bond_order,
     formula_string,
     FormulaError,
     dbe,
@@ -43,7 +44,7 @@ def graph_to_smiles(G: nx.Graph) -> Optional[str]:
             rw.AddAtom(Chem.Atom(label))
         idx = {node: k for k, node in enumerate(order)}
         for a, b, d in G.edges(data=True):
-            bt = int(d.get('bond_type', 1))
+            bt = bond_order(d.get('bond_type', 1))
             btype = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE,
                      3: Chem.BondType.TRIPLE}[bt]
             rw.AddBond(idx[a], idx[b], btype)
@@ -62,7 +63,7 @@ def graph_to_text(G: nx.Graph) -> str:
         nbs = []
         for nb in sorted(G.neighbors(node)):
             if nb > node:
-                nbs.append(f"{nb}:{G[node][nb].get('bond_type', 1)}")
+                nbs.append(f"{nb}:{bond_order(G[node][nb].get('bond_type', 1))}")
         parts.append(f"{node}{label}" + (f"({','.join(nbs)})" if nbs else ''))
     return ' '.join(parts)
 
@@ -225,7 +226,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             'structures': [
                 {
                     'atoms': [G.nodes[i].get('label', 'C') for i in sorted(G.nodes())],
-                    'bonds': [[int(a), int(b), int(d.get('bond_type', 1))]
+                    'bonds': [[int(a), int(b), bond_order(d.get('bond_type', 1))]
                               for a, b, d in G.edges(data=True)],
                 }
                 for G in graphs

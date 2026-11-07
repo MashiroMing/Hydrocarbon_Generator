@@ -61,7 +61,7 @@ def gen_buckets(formula, constraint=None, use_parallel=False):
     "并行/串行等价" 用例覆盖（见 main() 完整档）。
     """
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, err, _n_n = res
+    _, nc, nh, no, halo, _, err, _n_n, _n_p = res
     assert not err, f"parse error: {err}"
     h_equiv = nh + sum(halo)
     k = (2 * nc + 2 - h_equiv) // 2 if h_equiv else 3
@@ -73,7 +73,7 @@ def gen_buckets(formula, constraint=None, use_parallel=False):
 
 def expected_formula_str(formula):
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, _, _n_n = res
+    _, nc, nh, no, halo, _, _, _n_n, _n_p = res
     s = f"CH{nh}" if nc == 1 else f"C{nc}H{nh}"
     if no:
         s += f"O{no}" if no > 1 else "O"
@@ -225,7 +225,7 @@ def test_n_plus_halogen():
     check("N-氯代甲胺: 图公式 == CH4NCl（项目约定序 C→H→N→O→卤）",
           format_graph_formula(G) == 'CH4NCl', format_graph_formula(G))
     check("N-氯代甲胺: parts 含 1 个 Cl",
-          graph_formula_parts_full(G)[4][1] == 1,
+          graph_formula_parts_full(G)[5][1] == 1,
           str(graph_formula_parts_full(G)))
     check("N-氯代甲胺: 门禁对 CH4ClN 返回 True",
           formula_matches_input(G, 1, 4, 0, (0, 1, 0, 0), 0, n_nitrogen=1))
@@ -249,7 +249,7 @@ def test_gui_gate_simulation(formula, results=None):
     all_isomers = [(mt, G) for items in buckets.values()
                    for mt, G in items]
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, nd, _, _n_n = res
+    _, nc, nh, no, halo, nd, _, _n_n, _n_p = res
     before = len(all_isomers)
     filtered = filter_by_expected_formula(all_isomers, nc, nh, no, halo, nd)
     expect = expected_formula_str(formula)

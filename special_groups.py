@@ -196,7 +196,7 @@ def group_delta(key: str) -> Tuple[int, int, int, int, int, int]:
          got[1] - base[1],          # H
          got[2] - base[2],          # N
          got[3] - base[3],          # O
-         sum(got[4]) - sum(base[4]),  # 卤素总数
+         sum(got[5]) - sum(base[5]),  # 卤素总数
          net_charge(attached) - net_charge(host))
     _DELTA_CACHE[key] = d
     return d
@@ -289,7 +289,7 @@ def attach_group(G, node, group: str = 'nitro'):
 def describe(G) -> str:
     """返回"分子式 + 特殊基团统计"的可读字符串（自检/日志用）"""
     from utils import graph_formula_parts_full
-    n_c, n_h, n_n, n_o, halo = graph_formula_parts_full(G)
+    n_c, n_h, n_n, n_o, _n_p, halo = graph_formula_parts_full(G)
     base = f"C{n_c}" if n_c > 1 else "C"
     base += f"H{n_h}"
     if n_n:

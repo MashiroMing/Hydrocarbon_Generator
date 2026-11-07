@@ -644,6 +644,57 @@ def test_end_to_end():
               max(dists) <= 1.4, f"max={max(dists):.3f}")
 
 
+def test_phosphorus_export():
+    """含磷（第一期 C/H/P）导出：元素渲染 / 氢数 / 键级字符串口径 / 连通性"""
+    print("\n== 5.6 含磷导出（P=3 价；键级字符串口径） ==")
+    from Phosphorus import PhosphorusMatrixGenerator
+
+    graphs = PhosphorusMatrixGenerator(3, 1).generate(9)   # C3H9P
+    check("C3H9P 生成 4 个结构", len(graphs) == 4, f"{len(graphs)}")
+
+    G = graphs[0]
+    elem = lambda n, _G=G: _G.nodes[n].get('label', 'C')      # noqa: E731
+
+    # 键级必须是主程序约定的字符串（否则双/三键会被当单键）
+    bts = {d.get('bond_type') for _, _, d in G.edges(data=True)}
+    check("P 图 bond_type 为字符串口径",
+          bts <= {'single', 'double', 'triple'}, str(bts))
+
+    counts = hydrogen_counts(G, elem)
+    check("氢数按元素：P 得 3 − 键级 个 H", sum(counts.values()) == 9,
+          f"counts={counts}")
+    n_p = sum(1 for n, d in G.nodes(data=True) if d.get('label') == 'P')
+    check("图中 P 原子数为 1", n_p == 1, str(n_p))
+
+    heavy = {i: (i * 1.5, 0.0, 0.0) for i in sorted(G.nodes())}
+    hs = place_hydrogens(heavy, counts)
+    res = build_gjf("C3H9P Phosphorus Isomer #1", heavy, hs, G, element_of=elem)
+    blocks = _parse_blocks(res.text)
+    atom_elems = [l.split()[0] for l in blocks["atoms"]]
+    check("含磷：坐标段出现 P 元素", 'P' in atom_elems, f"atoms={atom_elems[:6]}")
+    check("含磷：校验零问题", validate_gjf(res.text) == [],
+          str(validate_gjf(res.text)))
+    check("含磷：输出连通性块（键级可读）", bool(res.connectivity),
+          str(res.warnings[:2]))
+
+    # 双键情形（C2H5P 含 P=C）
+    G2 = None
+    for g in PhosphorusMatrixGenerator(2, 1).generate(5):
+        if any(d.get('bond_type') == 'double' for _, _, d in g.edges(data=True)):
+            G2 = g
+            break
+    if G2 is not None:
+        elem2 = lambda n, _G=G2: _G.nodes[n].get('label', 'C')   # noqa: E731
+        c2 = hydrogen_counts(G2, elem2)
+        heavy2 = {i: (i * 1.5, 0.0, 0.0) for i in sorted(G2.nodes())}
+        res2 = build_gjf("C2H5P Isomer", heavy2, place_hydrogens(heavy2, c2),
+                         G2, element_of=elem2)
+        check("含磷双键：连通性块可写（P=C）", bool(res2.connectivity),
+              str(res2.warnings[:2]))
+        check("含磷双键：校验零问题", validate_gjf(res2.text) == [],
+              str(validate_gjf(res2.text)))
+
+
 def main():
     print("=" * 70)
     print("Gaussian .gjf 导出回归测试" + ("（含端到端档）" if RUN_E2E else ""))
@@ -655,6 +706,7 @@ def main():
     test_settings()
     test_nitrogen_export()
     test_oxygen_halogen_export()
+    test_phosphorus_export()
     if RUN_E2E:
         test_end_to_end()
     print("\n" + "=" * 70)

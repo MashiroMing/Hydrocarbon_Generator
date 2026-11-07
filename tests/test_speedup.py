@@ -76,7 +76,7 @@ def test_derive_parent():
     ]
     for fml, groups, exp in cases:
         r = parse_compound_formula(fml)
-        _mt, nc, nh, no, halo, _nd, err, nn = r
+        _mt, nc, nh, no, halo, _nd, err, nn, _np = r
         parent, e = derive_parent((nc, nh, nn, no, halo), groups)
         check(f"{fml} + {groups} → 母体 {exp}",
               e is None and parent == exp, f"{parent} / {e}")
@@ -95,7 +95,7 @@ def test_nitrobenzene_fast():
 
     gm = GeneratorManager()
     r = parse_compound_formula('C6H5NO2')
-    _mt, nc, nh, no, halo, _nd, err, nn = r
+    _mt, nc, nh, no, halo, _nd, err, nn, _np = r
     t0 = time.time()
     res = build_from_groups((nc, nh, nn, no, halo), {'nitro': 1},
                             lambda c, h: gm.generate_all(c, h))

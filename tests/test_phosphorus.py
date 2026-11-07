@@ -182,6 +182,40 @@ def test_cli_counts():
               (r.stderr or r.stdout).strip()[:40])
 
 
+def test_main_integration():
+    """与主程序共享层的集成：utils 解析 / 门禁 / 分子式 / 键级口径"""
+    print("\n== H. 与主程序（utils/structure_filter）集成 ==")
+    from utils import (format_graph_formula, formula_matches_input,
+                       graph_formula_parts_full, parse_compound_formula)
+    from structure_filter import filter_by_expected_formula
+
+    r = parse_compound_formula('C3H9P')
+    mt, nc, nh, no, halo, nd, err, nn, np_ = r
+    check("utils 解析 C3H9P（9 元组）",
+          err is None and mt == ['phosphorus'] and (nc, nh, np_) == (3, 9, 1),
+          str(r))
+
+    r_bad = parse_compound_formula('C2H5NOP')
+    check("P 与 N/O 互斥被拒", r_bad[6] is not None, str(r_bad[6])[:40])
+
+    graphs = PhosphorusMatrixGenerator(nc, np_).generate(nh)
+    check("门禁：formula_matches_input 全通过",
+          all(formula_matches_input(G, nc, nh, no, halo, nd, nn, np_)
+              for G in graphs), f'{len(graphs)} 个')
+    kept = filter_by_expected_formula(
+        [('phosphorus', G) for G in graphs], nc, nh, no, halo, nd,
+        None, nn, np_)
+    check("门禁：filter_by_expected_formula 不误删", len(kept) == len(graphs),
+          f'{len(kept)}/{len(graphs)}')
+    check("格式化分子式 C3H9P",
+          all(format_graph_formula(G) == 'C3H9P' for G in graphs))
+    check("parts 6 元组含 P 位",
+          all(graph_formula_parts_full(G)[4] == 1 for G in graphs))
+    check("bond_type 为字符串口径（与主程序一致）",
+          all(d.get('bond_type') in ('single', 'double', 'triple')
+              for G in graphs for _, _, d in G.edges(data=True)))
+
+
 def main():
     quick = '--quick' in sys.argv
     test_formula()
@@ -191,6 +225,7 @@ def main():
     test_equiv()
     test_cli()
     test_cli_counts()
+    test_main_integration()
     print("\n" + "=" * 60)
     print(f"结果: PASS={PASS}  FAIL={FAIL}")
     print("=" * 60)

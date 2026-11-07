@@ -19,6 +19,7 @@ __version__ = '1.0.0-phase1'
 
 from .formula import (  # noqa: F401
     P_VALENCE_OPTIONS,
+    bond_order,
     VALENCE,
     dbe,
     format_graph_formula_p,
@@ -39,5 +40,6 @@ __all__ = [
     'dbe',
     'VALENCE',
     'P_VALENCE_OPTIONS',
+    'bond_order',
     '__version__',
 ]

@@ -22,6 +22,7 @@ import networkx as nx
 
 from .atomic_matrix_p import PhosphorusMatrixGenerator
 from .formula import (
+    bond_order,
     FormulaError,
     dbe,
     format_graph_formula_p,
@@ -123,7 +124,7 @@ def check_props(formulas: Optional[List[str]] = None,
                 problems.append(f'公式不符：{parts} != {(n_c, n_h, n_p)}')
             for nd, d in G.nodes(data=True):
                 lab = d.get('label', 'C')
-                used = sum(int(G[nd][nb].get('bond_type', 1))
+                used = sum(bond_order(G[nd][nb].get('bond_type', 1))
                            for nb in G[nd])
                 want = valence_p if lab == 'P' else 4
                 if used > want:
@@ -178,7 +179,7 @@ def _node_match(a, b) -> bool:
 
 
 def _edge_match(a, b) -> bool:
-    return int(a.get('bond_type', 1)) == int(b.get('bond_type', 1))
+    return bond_order(a.get('bond_type', 1)) == bond_order(b.get('bond_type', 1))
 
 
 def main(argv: Optional[List[str]] = None) -> int:

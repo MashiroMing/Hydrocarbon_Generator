@@ -70,7 +70,7 @@ def generate_ours(formula):
     from utils import GeneratorManager
 
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, err, _n_n = res
+    _, nc, nh, no, halo, _, err, _n_n, _n_p = res
     if err:
         print(f"  [错误] 公式解析失败: {err}")
         return []

@@ -479,7 +479,7 @@ def _build_rdkit_mol(G, single_only=False):
     node_model = not any(
         ('oxo_counts' in d or 'halogen_counts' in d) for _, d in G.nodes(data=True)
     )
-    _V = {'C': 4, 'N': 3, 'O': 2, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
+    _V = {'C': 4, 'N': 3, 'O': 2, 'P': 3, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
 
     n_atoms = G.number_of_nodes()
     mol = Chem.RWMol()
@@ -778,6 +778,7 @@ class MoleculeApp:
         self.parsed_halogen_spec = (0, 0, 0, 0)
         self.parsed_n_oxygen = 0
         self.parsed_n_deuterium = 0
+        self.parsed_n_phosphorus = 0
 
         # 高级筛选约束
         self.structure_constraint = None  # StructureConstraint | None
@@ -1338,10 +1339,12 @@ class MoleculeApp:
                 if k >= 4:
                     show_benzene = True
 
-        # 含氮（单一标签，无苯环筛选）：仍需展示「全部 / 含氮化合物」行
+        # 含氮 / 含磷（单一标签，无苯环筛选）：仍需展示「全部 / 含氮(磷)化合物」行
         show_nitrogen = bool(mol_types) and 'nitrogen' in mol_types
+        show_phosphorus = bool(mol_types) and 'phosphorus' in mol_types
 
-        if (mol_types and len(mol_types) > 1) or show_benzene or show_nitrogen:
+        if ((mol_types and len(mol_types) > 1) or show_benzene
+                or show_nitrogen or show_phosphorus):
             # 有同分异构或可选苯环筛选
             self.type_filter_var.set('all')
             
@@ -1382,7 +1385,7 @@ class MoleculeApp:
             formula_str = self.molecule_input.get()
             from utils import parse_compound_formula
             (mol_types, nc, nh, no, halo_spec, nd,
-             error, n_nitrogen) = parse_compound_formula(formula_str)
+             error, n_nitrogen, n_phosphorus) = parse_compound_formula(formula_str)
 
             if error:
                 self.parsed_info_var.set(f"⚠ {error}")
@@ -1394,6 +1397,8 @@ class MoleculeApp:
                 extra = []
                 if n_nitrogen > 0:
                     extra.append(f"{n_nitrogen}N")
+                if n_phosphorus > 0:
+                    extra.append(f"{n_phosphorus}P")
                 if no > 0:
                     extra.append(f"{no}O")
                 total_halo = sum(halo_spec)
@@ -1410,6 +1415,7 @@ class MoleculeApp:
                 self.parsed_halogen_spec = halo_spec
                 self.parsed_n_oxygen = no
                 self.parsed_n_deuterium = nd
+                self.parsed_n_phosphorus = n_phosphorus
                 self._update_type_filter_visibility(mol_types)
         except Exception:
             pass
@@ -1574,7 +1580,7 @@ class MoleculeApp:
         formula_str = self.molecule_input.get().strip()
         nc, nh, no, halo_spec, k = 0, 0, 0, (0, 0, 0, 0), 0
         if formula_str:
-            (_, nc, nh, no, halo_spec, _, err, _n_n) = parse_compound_formula(formula_str)
+            (_, nc, nh, no, halo_spec, _, err, _n_n, _n_p) = parse_compound_formula(formula_str)
             if err:
                 nc = nh = no = 0
             total_halo = sum(halo_spec)
@@ -1918,10 +1924,11 @@ class MoleculeApp:
 
         formula_str = self.molecule_input.get().strip()
         
-        # 整合分子式解析（C+H+O+卤素+氘代）
+        # 整合分子式解析（C+H+O+卤素+氘代+N+P）
         from utils import parse_compound_formula
         (mol_types, n_carbon, n_hydrogen, n_oxygen,
-         halogen_spec, n_deuterium, error, n_nitrogen) = parse_compound_formula(formula_str)
+         halogen_spec, n_deuterium, error, n_nitrogen,
+         n_phosphorus) = parse_compound_formula(formula_str)
         if error:
             messagebox.showwarning("输入错误", error)
             return
@@ -1931,6 +1938,13 @@ class MoleculeApp:
 
         # ── 基团构建模式（勾选了基团 → 跳过完整枚举，走极速构建）──
         _group_counts = self._selected_groups()
+        if _group_counts and n_phosphorus > 0:
+            messagebox.showwarning(
+                "基团构建模式不适用",
+                "基团构建模式（碳骨架 + 基团）暂不支持含磷分子式。\n"
+                "请取消基团勾选后重试（含磷走完备枚举，速度也很快）。",
+                parent=self.root)
+            return
         if _group_counts:
             from group_builder import derive_parent
             _parent, _perr = derive_parent(
@@ -1954,6 +1968,24 @@ class MoleculeApp:
                     parent=self.root):
                 return
         self._pending_group_counts = _group_counts
+
+        # ── 含磷：重原子上限预检 + 大式确认（P 系枚举很快，但仍设护栏）──
+        if n_phosphorus > 0 and not _group_counts:
+            n_heavy = n_carbon + n_phosphorus
+            if n_heavy > _N_MAX_ATOMS:
+                messagebox.showwarning(
+                    "超出上限",
+                    f"含磷分子重原子数 {n_heavy} 超过枚举上限 {_N_MAX_ATOMS}。\n"
+                    f"请减小分子式规模。")
+                return
+            if n_heavy >= 8:
+                if not messagebox.askyesno(
+                        "含磷枚举规模提示",
+                        f"含磷完备枚举：重原子数 = {n_heavy}"
+                        f"（C{n_carbon}P{n_phosphorus}）。\n"
+                        f"结构数可能较多，生成会占用一定时间。\n\n是否继续？",
+                        parent=self.root):
+                    return
 
         # ── 含氮：重原子上限预检 + 耗时确认（§13.2-Step3 约定）──
         #   路线 A（2026-09-21）起含氮可带 O → 重原子数 = nC + nN + nO
@@ -2016,6 +2048,8 @@ class MoleculeApp:
         self.progress_var.set(0)
         self.progress_label.config(text="准备生成...")
         parts = []
+        if n_phosphorus > 0:
+            parts.append(f"{n_phosphorus}P")
         if n_oxygen > 0:
             parts.append(f"{n_oxygen}O")
         if total_halogen > 0:
@@ -2035,7 +2069,7 @@ class MoleculeApp:
         thread = threading.Thread(
             target=self._generate_in_background,
             args=(target_types, n_carbon, type_filter, halogen_spec, n_oxygen,
-                  constraint, n_deuterium, n_nitrogen),
+                  constraint, n_deuterium, n_nitrogen, n_phosphorus),
             kwargs={'group_counts': getattr(self, '_pending_group_counts', None)}
         )
         thread.daemon = True
@@ -2050,8 +2084,8 @@ class MoleculeApp:
     def _generate_in_background(self, target_types, n_carbon, type_filter='all',
                                  halogen_spec=(0, 0, 0, 0), n_oxygen=0,
                                  constraint=None, n_deuterium=0, n_nitrogen=0,
-                                 group_counts=None):
-        """在后台线程中生成异构体（支持 N / O + 卤素取代 + 高级筛选）"""
+                                 n_phosphorus=0, group_counts=None):
+        """在后台线程中生成异构体（支持 P / N / O + 卤素取代 + 高级筛选）"""
         try:
             cancelled = False
             all_isomers = []       # [(mol_type, isomer_data), ...]
@@ -2097,6 +2131,31 @@ class MoleculeApp:
             # 卤素数"枚举，再走与烃类相同的 HalogenSubstitutionGenerator 取代位置枚举。
             if group_counts:
                 type_counts = type_counts                     # 已在构建分支处理
+
+            # ── 含磷模式（第一期：C/H/P；P 与 O/N/卤素互斥，解析层已拦截）──
+            #   引擎：Phosphorus/atomic_matrix_p.py（完备枚举，与 MAYGEN 逐式一致）
+            elif n_phosphorus > 0:
+                from Phosphorus import PhosphorusMatrixGenerator
+                n_heavy = n_carbon + n_phosphorus
+                if n_heavy > _N_MAX_ATOMS:
+                    raise ValueError(
+                        f"含磷分子重原子数 {n_heavy} 超过枚举上限 {_N_MAX_ATOMS}，"
+                        f"请减小分子式规模。")
+                self._update_progress(10, "生成含磷异构体（完备枚举）...")
+                _p_gen = PhosphorusMatrixGenerator(n_carbon, n_phosphorus)
+                if not _p_gen._can_enumerate():
+                    raise ValueError(
+                        f"含磷分子重原子数 {n_heavy} 无法枚举"
+                        f"（预言机上限 {_N_MAX_ATOMS}）。")
+                _p_graphs = _p_gen.generate(n_hydrogen)
+                for _g in _p_graphs:
+                    if self.cancel_requested or self.window_closed:
+                        cancelled = True
+                        break
+                    all_isomers.append(('phosphorus', _g))
+                type_counts = ({'phosphorus': len(all_isomers)}
+                               if all_isomers else {})
+
             elif n_nitrogen > 0:
                 from Nitrogen import AtomicMatrixNGenerator
                 n_heavy = n_carbon + n_nitrogen + n_oxygen
@@ -2304,6 +2363,7 @@ class MoleculeApp:
                     n_deuterium,
                     to_graph_fn=lambda mt, d: _canon_to_graph(d, mt, self.gen_mgr),
                     n_nitrogen=n_nitrogen,
+                    n_phosphorus=n_phosphorus,
                 )
                 if before_f != len(all_isomers):
                     print(f"  分子式门禁: 剔除 {before_f - len(all_isomers)} 个"
@@ -2335,7 +2395,7 @@ class MoleculeApp:
             if not self.window_closed:
                 self.root.after(0, self._update_isomer_list, all_isomers, target_types,
                                 n_carbon, type_counts, cancelled, halogen_spec, n_oxygen,
-                                n_nitrogen)
+                                n_nitrogen, n_phosphorus)
 
         except Exception as e:
             if not self.window_closed:
@@ -2366,11 +2426,12 @@ class MoleculeApp:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _build_display_meta(self, all_isomers, n_carbon, n_oxygen=0,
-                            halogen_spec=(0, 0, 0, 0), n_nitrogen=0):
+                            halogen_spec=(0, 0, 0, 0), n_nitrogen=0,
+                            n_phosphorus=0):
         """计算每个异构体的展示元数据，缓存在 self._display_meta。
 
         meta[idx] = (formula, cn_name, feature, fg_tags, o_dist)
-          formula: 实际分子式（含 N/O/卤素）；feature: 主链长度/环大小特征值；
+          formula: 实际分子式（含 N/O/P/卤素）；feature: 主链长度/环大小特征值；
           fg_tags: 含氧官能团标签集合（frozenset，纯图判定，无 O 时为空）；
           o_dist: O 分布形态（'substituent_only'/'backbone_only'/'mixed'/'none'）。
         """
@@ -2397,8 +2458,8 @@ class MoleculeApp:
                 # 由 _start_fg_tags_computation 同步（小集合）或后台分块
                 # （大集合）填充 _fg_tags_cache（见 4.10）
                 meta.append((formula, cn_name, feat, None, None))
-        elif n_nitrogen > 0:
-            # 含氮（第一阶段纯 C/H/N）：分子式走统一事实源（自带 N 前缀）
+        elif n_nitrogen > 0 or n_phosphorus > 0:
+            # 含氮 / 含磷（节点模型）：分子式走统一事实源（自带 N / P 前缀）
             from utils import format_graph_formula
             for mol_type, data in all_isomers:
                 if hasattr(data, 'nodes'):
@@ -2689,7 +2750,7 @@ class MoleculeApp:
 
     def _update_isomer_list(self, all_isomers, target_types, n_carbon, type_counts,
                              cancelled=False, halogen_spec=(0, 0, 0, 0), n_oxygen=0,
-                             n_nitrogen=0):
+                             n_nitrogen=0, n_phosphorus=0):
         """更新异构体列表"""
         if self.window_closed:
             return
@@ -2718,7 +2779,7 @@ class MoleculeApp:
 
             # 统一计算展示元数据（分子式 / 骨架类型 / 特征值）
             self._build_display_meta(all_isomers, n_carbon, n_oxygen, halogen_spec,
-                                     n_nitrogen)
+                                     n_nitrogen, n_phosphorus)
 
             # 构建特征值筛选数据（复用 _display_meta，避免重复计算）
             self._update_filter_options(all_isomers,
@@ -2736,6 +2797,8 @@ class MoleculeApp:
 
             total_count = len(all_isomers)
             suffix_parts = []
+            if n_phosphorus > 0:
+                suffix_parts.append(f"{n_phosphorus}P")
             if n_nitrogen > 0:
                 suffix_parts.append(f"{n_nitrogen}N")
             if n_oxygen > 0:
@@ -3088,9 +3151,9 @@ class MoleculeApp:
 
             formulas = {mt: compute_formula(mt, n_carbon, getattr(self, '_current_n_hydrogen', None)) for mt in mol_names}
 
-            # 卤代/含氧/含氮：覆盖分子式为实际分子式
+            # 卤代/含氧/含氮/**含磷**：覆盖分子式为实际分子式
             actual_formula = None
-            if mol_type == 'nitrogen' and isinstance(isomer_data, nx.Graph):
+            if mol_type in ('nitrogen', 'phosphorus') and isinstance(isomer_data, nx.Graph):
                 from utils import format_graph_formula
                 actual_formula = format_graph_formula(isomer_data)
             elif has_oxygen and isinstance(isomer_data, nx.Graph):
@@ -3131,7 +3194,7 @@ class MoleculeApp:
                 else:
                     info = self._get_graph_info_text(isomer_data, idx, mol_type, formulas,
                                                       halogen_formula=actual_formula)
-            elif mol_type == 'nitrogen':
+            elif mol_type in ('nitrogen', 'phosphorus'):
                 info = self._get_graph_info_text(isomer_data, idx, mol_type, formulas,
                                                   halogen_formula=actual_formula)
             else:
@@ -3476,11 +3539,11 @@ class MoleculeApp:
         has_halogen = halogen_formula is not None
         has_oxygen = self.parsed_n_oxygen > 0
 
-        # ── 含氮结构（第一阶段纯 C/H/N）：用统一事实源统计 ──
-        #  逐原子的既有分支对 N 会误判（max_v 取 2、H 数落入 2n 口径），故单独收口。
-        if mol_type == 'nitrogen':
+        # ── 含氮 / 含磷结构（节点模型）：用统一事实源统计 ──
+        #  逐原子的既有分支对 N/P 会误判（max_v 取 2、H 数落入 2n 口径），故单独收口。
+        if mol_type in ('nitrogen', 'phosphorus'):
             from utils import graph_formula_parts_full, format_graph_formula
-            _n_c, _n_h, _n_n, _n_o, _halo = graph_formula_parts_full(G)
+            _n_c, _n_h, _n_n, _n_o, _n_p, _halo = graph_formula_parts_full(G)
             _adj_lines = []
             for _node in sorted(G.nodes()):
                 _lbl = G.nodes[_node].get('label', 'C')
@@ -3499,7 +3562,7 @@ class MoleculeApp:
 原子统计:
   - 碳原子数: {_n_c}
   - 氮原子数: {_n_n}
-{('  - 氧原子数: ' + str(_n_o) + chr(10)) if _n_o > 0 else ''}  - 氢原子数: {_n_h}
+{('  - 磷原子数: ' + str(_n_p) + chr(10)) if _n_p > 0 else ''}{('  - 氧原子数: ' + str(_n_o) + chr(10)) if _n_o > 0 else ''}  - 氢原子数: {_n_h}
   - 重原子数: {G.number_of_nodes()}
   - 总原子数: {G.number_of_nodes() + _n_h}
 
@@ -3512,7 +3575,7 @@ class MoleculeApp:
 """
             for _line in _adj_lines:
                 _txt += f"  {_line}\n"
-            _txt += "\n提示: 含氮结构的键线式 / 3D 可视化 / .gjf 导出均已支持。\n"
+            _txt += "\n提示: 含氮/含磷结构的键线式 / 3D 可视化 / .gjf 导出均已支持。\n"
             if getattr(self, '_build_mode_info', None) is not None:
                 _b = self._build_mode_info
                 _txt += (f"\n⚠ 基团构建模式（非完备）：母体骨架 {_b.parent_formula}，"
@@ -5052,6 +5115,12 @@ class MoleculeApp:
                 formula = format_formula(n_carbon, self._current_n_hydrogen) if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else (f"CH?" if n_carbon == 1 else f"C{n_carbon}H?")
                 desc = self.unified_generator.describe_isomer(isomer)
                 self.unified_generator.visualize_isomer(isomer, title=f"{formula} 多环多烯炔烃 #{idx+1} ({desc})")
+            elif isomer_mol_type == 'phosphorus':
+                # 含磷（第一期 C/H/P）：P 以橙色标注元素符号
+                _fml = (format_graph_formula(isomer)
+                        if hasattr(isomer, 'nodes') else '磷化合物')
+                self._visualize_nitrogen(
+                    isomer, f'{_fml} 磷化合物 #{idx+1}')
             elif isomer_mol_type == 'nitrogen':
                 # 含氮（第二期接入）：纯 C/H/N，N 以蓝色标注元素符号
                 _fml = format_graph_formula(isomer) if hasattr(isomer, 'nodes') else "含氮化合物"
@@ -6582,8 +6651,9 @@ class MoleculeApp:
             fig, ax = _build_3d_axes(title)
             _draw_cc_bonds(ax, G, c_coords, linewidth=2)
 
-            # 重原子：按元素着色（C 黑 / N 蓝 / O 红），杂原子额外标注元素符号
-            _COLOR = {'C': 'black', 'N': '#1f4fd8', 'O': '#cc2222'}
+            # 重原子：按元素着色（C 黑 / N 蓝 / O 红 / P 橙），杂原子额外标注元素符号
+            _COLOR = {'C': 'black', 'N': '#1f4fd8', 'O': '#cc2222',
+                      'P': '#c06000'}
             for n in sorted(c_coords):
                 lab = G.nodes[n].get('label', 'C') if n in G.nodes else 'C'
                 color = _COLOR.get(lab, 'black')
