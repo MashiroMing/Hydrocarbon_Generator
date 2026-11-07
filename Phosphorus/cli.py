@@ -12,12 +12,13 @@ import argparse
 import json
 import sys
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import networkx as nx
 
 from .atomic_matrix_p import PhosphorusMatrixGenerator
 from .formula import (
+    formula_string,
     FormulaError,
     dbe,
     format_graph_formula_p,
@@ -69,8 +70,22 @@ def graph_to_text(G: nx.Graph) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='python -m Phosphorus.cli',
-        description='含磷异构体生成器（第一期：仅 C/H/P，P 默认 3 价）')
-    p.add_argument('formula', help='分子式，如 C3H9P / CH5P / C6H13P')
+        description='含磷异构体生成器（第一期：仅 C/H/P，P 默认 3 价）',
+        epilog=('三种输入方式等价：\n'
+                '  1) 分子式：      python -m Phosphorus.cli C3H9P\n'
+                '  2) 分开给个数：  python -m Phosphorus.cli --c 3 --h 9 --p 1\n'
+                '  3) 交互式：      python -m Phosphorus.cli --interactive'),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('formula', nargs='?',
+                   help='分子式，如 C3H9P / CH5P / C6H13P（与 --c/--h/--p 二选一）')
+    p.add_argument('--c', '--carbon', dest='n_c', type=int, metavar='N',
+                   help='碳原子数')
+    p.add_argument('--h', '--hydrogen', dest='n_h', type=int, metavar='N',
+                   help='氢原子数')
+    p.add_argument('--p', '--phosphorus', dest='n_p', type=int, metavar='N',
+                   help='磷原子数（需要 ≥1）')
+    p.add_argument('--interactive', action='store_true',
+                   help='交互式输入 C/H/P 个数（逐项提示）')
     p.add_argument('--count', action='store_true',
                    help='只输出计数（格式：式<TAB>计数<TAB>秒，便于与 MAYGEN 对拍）')
     p.add_argument('--smi', action='store_true', help='每行输出一个 SMILES')
@@ -86,10 +101,67 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _read_int(prompt: str, default: Optional[int] = None) -> int:
+    """交互式读取一个非负整数（回车用默认值）
+
+    提示信息走 **stderr**，stdout 只保留结果（便于脚本/对拍直接解析）。
+    """
+    while True:
+        hint = f"（回车默认 {default}）" if default is not None else ""
+        print(f"{prompt}{hint}：", end='', file=sys.stderr, flush=True)
+        raw = sys.stdin.readline().strip()
+        if raw == '':
+            if default is not None:
+                return default
+            print("请输入整数。", file=sys.stderr)
+            continue
+        try:
+            val = int(raw)
+        except ValueError:
+            print("请输入整数。", file=sys.stderr)
+            continue
+        if val < 0:
+            print("请输入非负整数。", file=sys.stderr)
+            continue
+        return val
+
+
+def _resolve_input(args) -> Tuple[str, int, int, int]:
+    """统一入口：分子式 / 分开个数 / 交互式 → (显示用式, nC, nH, nP)"""
+    has_counts = any(v is not None for v in (args.n_c, args.n_h, args.n_p))
+    given = sum(v is not None for v in (args.n_c, args.n_h, args.n_p))
+    if args.formula and has_counts:
+        raise FormulaError("分子式与 --c/--h/--p 只能二选一")
+    if args.interactive and (args.formula or has_counts):
+        raise FormulaError("--interactive 不能与分子式/--c/--h/--p 同时使用")
+
+    if args.interactive:
+        print("交互式输入（P 个数需要 ≥1）", file=sys.stderr)
+        n_c = _read_int("碳原子数 C", 0)
+        n_h = _read_int("氢原子数 H", 0)
+        n_p = _read_int("磷原子数 P", 1)
+        if n_p < 1:
+            raise FormulaError("磷原子数必须 ≥1")
+        return (formula_string(n_c, n_h, n_p), n_c, n_h, n_p)
+
+    if has_counts:
+        if given != 3:
+            raise FormulaError("--c / --h / --p 必须同时给出（三个都要）")
+        n_c, n_h, n_p = args.n_c, args.n_h, args.n_p
+        if n_c < 0 or n_h < 0 or n_p < 1:
+            raise FormulaError("个数必须非负，且 P ≥ 1")
+        return (formula_string(n_c, n_h, n_p), n_c, n_h, n_p)
+
+    if not args.formula:
+        raise FormulaError("请提供分子式，或使用 --c/--h/--p，或 --interactive")
+    n_c, n_h, n_p = parse_formula_p(args.formula)
+    return (args.formula, n_c, n_h, n_p)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        n_c, n_h, n_p = parse_formula_p(args.formula)
+        formula, n_c, n_h, n_p = _resolve_input(args)
     except FormulaError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
@@ -111,7 +183,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               "（用 --max-atoms 调整）", file=sys.stderr)
         return 2
     if not gen.feasible(n_h):
-        print(f"错误：{args.formula} 在该口径下无解"
+        print(f"错误：{formula} 在该口径下无解"
               f"（N={gen.N}, H={n_h}）", file=sys.stderr)
         return 1
 
@@ -137,15 +209,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 4
 
     if args.count:
-        print(f"{args.formula}\t{len(graphs)}\t{elapsed:.3f}")
+        print(f"{formula}\t{len(graphs)}\t{elapsed:.3f}")
     elif args.smi:
         for G in graphs:
             smi = graph_to_smiles(G)
             print(smi if smi is not None else graph_to_text(G))
     elif args.json:
         data = {
-            'formula': format_graph_formula_p(graphs[0], args.valence_p) if graphs else args.formula,
-            'input_formula': args.formula,
+            'formula': format_graph_formula_p(graphs[0], args.valence_p) if graphs else formula,
+            'input_formula': formula,
             'dbe': k,
             'valence_p': args.valence_p,
             'count': len(graphs),
@@ -163,7 +235,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump(data, f, ensure_ascii=False, indent=1)
         print(f"已写入 {args.json}（{len(graphs)} 个结构，{elapsed:.3f}s）")
     else:
-        print(f"分子式 {args.formula}：{len(graphs)} 个结构（{elapsed:.3f}s）")
+        print(f"分子式 {formula}：{len(graphs)} 个结构（{elapsed:.3f}s）")
         for G in graphs[:20]:
             smi = graph_to_smiles(G)
             print('  ' + (smi if smi is not None else graph_to_text(G)))

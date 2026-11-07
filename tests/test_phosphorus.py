@@ -137,6 +137,51 @@ def test_cli():
           (r.stderr or r.stdout).strip()[:40])
 
 
+def test_cli_counts():
+    """C/H/P 独立输入（--c/--h/--p）、交互式、与分子式等价、单原子边界"""
+    print("\n== G. CLI 独立个数输入 ==")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONIOENCODING='utf-8')
+
+    def run(*args, stdin=None):
+        return subprocess.run([sys.executable, '-m', 'Phosphorus.cli', *args],
+                              cwd=root, capture_output=True, text=True,
+                              input=stdin, encoding='utf-8',
+                              errors='replace', env=env)
+
+    # 个数输入 == 分子式输入
+    a = run('C3H9P', '--count').stdout.split()
+    b = run('--c', '3', '--h', '9', '--p', '1', '--count').stdout.split()
+    check("个数输入 == 分子式输入", len(a) >= 2 and len(b) >= 2 and a[:2] == b[:2],
+          f"{' '.join(a[:2])} vs {' '.join(b[:2])}")
+
+    r = run('--c', '6', '--h', '13', '--p', '1', '--count')
+    check("--c 6 --h 13 --p 1 → C6H13P=284",
+          r.returncode == 0 and r.stdout.split()[:2] == ['C6H13P', '284'],
+          r.stdout.strip()[:30])
+
+    # 单原子边界（PH3）：曾因连通计数误判为 0
+    r = run('--c', '0', '--h', '3', '--p', '1', '--count')
+    check("单原子 H3P=1", r.returncode == 0
+          and r.stdout.split()[:2] == ['H3P', '1'], r.stdout.strip()[:30])
+    check("单原子 H3P 图性质",
+          len(PhosphorusMatrixGenerator(0, 1).generate(3)) == 1)
+
+    # 交互式（管道喂入 3 / 9 / 1）
+    r = run('--interactive', '--count', stdin='3\n9\n1\n')
+    check("交互式输入 → C3H9P=4", r.returncode == 0
+          and r.stdout.split()[:2] == ['C3H9P', '4'],
+          r.stdout.strip().splitlines()[-1][:40])
+
+    # 错误路径
+    for args, why in [(('--c', '3', '--h', '9'), '缺 --p'),
+                      (('C3H9P', '--c', '3', '--h', '9', '--p', '1'), '二选一'),
+                      (('--c', '3', '--h', '9', '--p', '0'), 'P≥1')]:
+        r = run(*args, '--count')
+        check(f"拒绝：{why}", r.returncode == 2,
+              (r.stderr or r.stdout).strip()[:40])
+
+
 def main():
     quick = '--quick' in sys.argv
     test_formula()
@@ -145,6 +190,7 @@ def main():
     test_props(quick)
     test_equiv()
     test_cli()
+    test_cli_counts()
     print("\n" + "=" * 60)
     print(f"结果: PASS={PASS}  FAIL={FAIL}")
     print("=" * 60)

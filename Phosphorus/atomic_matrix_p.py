@@ -386,7 +386,8 @@ class PhosphorusMatrixGenerator:
             if pos_idx == self.num_positions:
                 if used_valence != valence_target:
                     return
-                if n_conn_c + n_conn_p != N:
+                # 单原子（N=1，如 PH3）：无连接可言，直接记录（连通计数不适用）
+                if N > 1 and n_conn_c + n_conn_p != N:
                     return
                 if not _is_graph_connected(M, N):
                     return

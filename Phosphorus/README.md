@@ -16,12 +16,20 @@
 ## 快速开始
 
 ```bash
+# 方式 1：直接写分子式
 python -m Phosphorus.cli C3H9P              # 列出结构（SMILES）
 python -m Phosphorus.cli C3H9P --count      # 式<TAB>计数<TAB>秒（便于与 MAYGEN 对拍）
 python -m Phosphorus.cli C6H13P --smi       # 每行一个 SMILES
 python -m Phosphorus.cli C3H7P --json out.json
 python -m Phosphorus.cli C6H15P --parallel  # 前缀并行（结果与串行一致）
-python -m Phosphorus.cli PH3 --count        # 也支持无碳含磷式
+
+# 方式 2：分别输入 C / H / P 个数（与写分子式完全等价）
+python -m Phosphorus.cli --c 3 --h 9 --p 1 --count      # → C3H9P  4
+python -m Phosphorus.cli --c 0 --h 3 --p 1 --count      # → H3P    1（PH3）
+python -m Phosphorus.cli --c 6 --h 13 --p 1 --count     # → C6H13P 284
+
+# 方式 3：交互式逐项提示（回车用默认值）
+python -m Phosphorus.cli --interactive
 ```
 
 ```python
@@ -41,8 +49,9 @@ python tests/test_phosphorus.py           # 项目测试（21 断言，约 16s�
 python tests/test_phosphorus.py --quick   # 小锚点快速档
 ```
 
-**当前状态**：锚点 21/21 全对（含 C6H13P=284、`P2`=1、`C2H2P2`=19 等），
-全套测试 PASS=21 / FAIL=0。
+**当前状态**：锚点 21/21 全对；**系统性对拍 53/53 一致**
+（C 0..4 × P 1..3 × DBE 0..3，含 C4H8P2=633、C3H7P3=681、P2/P3 等），
+全套测试 PASS=26 / FAIL=0。
 
 ## 架构
 

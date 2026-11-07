@@ -352,3 +352,46 @@ python -m Phosphorus.validate --props       # 公式/连通性/价态自检
 
 **性能**：C6H13P（284 结构）1.46–1.58s；全部锚点 3s；并行仅对前缀切分有意义，
 小规模默认串行（进程池启动开销 > 收益）。
+
+### 10.1 第二轮补充（2026-11-07，用户独立测试前）
+
+**① CLI 支持用户直接输入 C/H/P 个数（与分子式完全等价）**
+
+```bash
+python -m Phosphorus.cli --c 3 --h 9 --p 1 --count     # → C3H9P  4
+python -m Phosphorus.cli --c 0 --h 3 --p 1 --count     # → H3P    1（PH3）
+python -m Phosphorus.cli --interactive                 # 逐项提示（提示走 stderr）
+```
+
+- `--c/--h/--p` 必须**三个同时给**；与分子式位置参数**二选一**；P 必须 ≥1；
+- 交互式提示输出到 **stderr**，stdout 只留结果（便于脚本/对拍解析）。
+
+**② 系统性对拍（53 个 C/H/P 组合，vs MAYGEN 1.8）：53/53 全部一致**
+
+覆盖 C 0..4 × P 1..3 × DBE 0..3，含边界与多磷：
+
+| 类型 | 示例 | 结果 |
+|---|---|---|
+| 单原子 | H3P=1、HP=0 | ✓ |
+| 最少原子 | CHP=1、CP2=1 | ✓ |
+| 多磷 | P2=1、H2P2=1、H3P3=2、H5P3=1 | ✓ |
+| 中型 | C4H8P2=**633**、C3H7P3=**681**、C3H5P3=**969** | ✓ |
+| 已有锚点 | C6H13P=284、C6H15P=39、C4H12P2=38 | ✓ |
+
+用时 18.3s（MAYGEN 每式 ~0.2s，本模块总计 <3s）。
+
+**③ 修复单原子边界 bug**：`H3P`（PH₃）原被"连通计数"误判为 0
+（N=1 时无连接可计），修后 = 1，与 MAYGEN 一致。
+
+**④ 关于"内置预言机是否需要更迭"的结论**
+
+| 对象 | 是否需要改 | 说明 |
+|---|---|---|
+| `Phosphorus/atomic_matrix_p.py` | **不需要** | 它本身就是 P 的**完备预言机**；CLI/库已直接使用；53 式对拍即完备性证明 |
+| `oxygen/boundary.py` + `tools/boundary_report.py` | **暂不需要** | 二者是 **O 专用**（`utils.parse_compound_formula` 不认 P，内部用 O 的 `AtomicMatrixGenerator`）；实测 `boundary_report.py C3H9P` 会"跳过" |
+| `Nitrogen/validate.py` 锚点 | 不需要 | P 有独立的 `Phosphorus/validate.py` |
+| `utils.parse_compound_formula` / 公式门禁 | **接入 GUI 时才需要** | 属计划 §7 的集成清单（`utils` 解析 → 类型判定 → 渲染/`.gjf`） |
+
+> 一期 P 没有"树机制"（直接走矩阵预言机）→ 覆盖率天然 100%，**边界分析工具无意义**；
+> 待二期引入 P 的快速树生成器或接入主程序时，再用 `PhosphorusMatrixGenerator`
+> 作为"完备"一侧扩展 `boundary.py` 即可。
