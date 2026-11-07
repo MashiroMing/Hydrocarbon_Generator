@@ -739,12 +739,21 @@ class MoleculeApp:
     def __init__(self, root):
         self.root = root
         self.root.title("分子异构体生成及可视化")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
+        # 默认尺寸：保证三栏（列表｜键线式｜信息）在非最大化时也能完整显示
+        self.root.geometry("1100x760")
+        self.root.minsize(880, 660)
 
         # 窗口状态标志
         self.window_closed = False
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        # 布局相关状态（可拖拽分栏 / 尺寸记忆 / 键线式重绘节流）
+        self._layout_default_geometry = "1100x760"
+        self._layout_saved_sash = None     # (h_sash, v_sash) 或 None
+        self._layout_restored = False
+        self._canvas_resize_job = None     # after id（拖动分栏时延后重绘）
+        self._current_detail = None        # (isomer_data, mol_type) 供尺寸变化后重绘
+        self._last_canvas_size = (0, 0)
 
         # 初始化各生成器
         self._init_generators()
@@ -779,6 +788,11 @@ class MoleculeApp:
 
         # 配置样式
         self._configure_styles()
+
+        # 恢复上次布局（窗口大小 + 分隔条位置）；无记录则保持默认
+        self._restore_layout()
+        # 首次映射后按比例设置分隔条（不依赖子控件请求尺寸）
+        self.root.after(200, self._init_panes)
 
     def _show_usage(self):
         """弹窗显示使用说明"""
@@ -920,6 +934,10 @@ class MoleculeApp:
         self.window_closed = True
         self.cancel_requested = True
         try:
+            self._save_layout()      # 记忆窗口尺寸与分隔条位置
+        except Exception:
+            pass
+        try:
             plt.close('all')  # 关闭所有 matplotlib 窗口
         except:
             pass
@@ -957,14 +975,14 @@ class MoleculeApp:
     def _create_widgets(self):
         """创建界面组件"""
         # 主容器（使用 grid 确保底部按钮始终可见）
-        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.rowconfigure(2, weight=1)  # 只有结果区域可伸缩
         main_frame.columnconfigure(0, weight=1)
 
         # ===== 标题区域 =====
         title_frame = ttk.Frame(main_frame)
-        title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 15))
+        title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         # 三列布局：左弹性 | 标题居中 | 按钮右对齐
         title_frame.columnconfigure(0, weight=1)
@@ -987,7 +1005,7 @@ class MoleculeApp:
         self._help_tooltip = CreateToolTip(self.help_btn, "使用说明")
 
         # ===== 输入区域 =====
-        input_frame = ttk.LabelFrame(main_frame, text="分子输入", padding="10")
+        input_frame = ttk.LabelFrame(main_frame, text="分子输入", padding="6")
         input_frame.grid(row=1, column=0, sticky="ew", pady=10)
 
         # 分子式输入行
@@ -1091,17 +1109,15 @@ class MoleculeApp:
         self.progress_label = ttk.Label(progress_frame, text="就绪", style='Info.TLabel')
         self.progress_label.pack(fill=tk.X, padx=5)
 
-        # ===== 结果显示区域 =====
-        result_frame = ttk.Frame(main_frame)
-        result_frame.grid(row=2, column=0, sticky="nsew", pady=10)
-        # 列表列优先分配宽度（3:1），右侧信息栏不抢占（Canvas 默认宽已调小）
-        result_frame.columnconfigure(0, weight=3)
-        result_frame.columnconfigure(1, weight=1)
-        result_frame.rowconfigure(0, weight=1)
+        # ===== 结果显示区域：左右**可拖拽**分栏（ttk.PanedWindow）=====
+        result_frame = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        result_frame.grid(row=2, column=0, sticky="nsew", pady=6)
+        self._hpaned = result_frame
+        result_frame.bind('<Double-Button-1>', self._on_paned_double_click)
 
         # 左侧：异构体列表
         list_frame = ttk.LabelFrame(result_frame, text="异构体列表", padding="5")
-        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+        result_frame.add(list_frame, weight=3)
         # list_frame 子级用 grid 布局（顺序确定、宽度可靠；FG 面板用
         # grid_remove/grid 显隐且保留配置，避免 pack 重排顺序问题）
         list_frame.columnconfigure(0, weight=1)
@@ -1196,26 +1212,33 @@ class MoleculeApp:
         self.isomer_listbox.bind('<<ListboxSelect>>', self._on_isomer_selected)
         list_scroll.config(command=self.isomer_listbox.yview)
 
-        # 右侧：信息显示
+        # 右侧：信息显示（上下**可拖拽**：上=键线式，下=结构信息文本）
         info_frame = ttk.LabelFrame(result_frame, text="分子信息", padding="5")
-        info_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
+        result_frame.add(info_frame, weight=1)
 
         # 占位行，与左侧筛选行等高，使浅色内容区顶部对齐
         info_spacer = ttk.Frame(info_frame, height=24)
         info_spacer.pack(fill=tk.X, pady=(0, 5))
         info_spacer.pack_propagate(False)
 
-        # 键线式图片区域（width=300 限制请求宽，避免抢占左侧列表宽度；
-        # 图片渲染时按 Canvas 实际宽度等比缩放）
+        self._vpaned = ttk.PanedWindow(info_frame, orient=tk.VERTICAL)
+        self._vpaned.pack(fill=tk.BOTH, expand=True)
+        self._vpaned.bind('<Double-Button-1>', self._on_paned_double_click)
+
+        # 上栏：键线式图片 —— 去掉固定请求尺寸（width=1/height=1），随分栏伸缩；
+        # 渲染时按 Canvas 实际尺寸出图，尺寸变化后节流重绘（见 _on_canvas_configure）
+        cv_box = ttk.Frame(self._vpaned)
         self._formula_canvas = tk.Canvas(
-            info_frame,
-            width=300,
-            height=200,
+            cv_box,
+            width=1,
+            height=1,
             bg='white',
             highlightthickness=1,
             highlightbackground='#cccccc',
         )
-        self._formula_canvas.pack(fill=tk.X, pady=(0, 5))
+        self._formula_canvas.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self._formula_canvas.bind('<Configure>', self._on_canvas_configure)
+        self._vpaned.add(cv_box, weight=3)
         self._formula_photo = None  # 保持对 PhotoImage 的引用，防止被 GC
         self._skeletal_png_data = None  # 原始 PNG 字节
 
@@ -1227,18 +1250,21 @@ class MoleculeApp:
         # macOS 兼容
         self._formula_canvas.bind("<Button-2>", self._on_formula_canvas_right_click)
 
-        # 文本信息区域
+        # 下栏：文本信息
+        txt_box = ttk.Frame(self._vpaned)
         self.info_text = scrolledtext.ScrolledText(
-            info_frame,
+            txt_box,
             width=40,
+            height=6,
             font=('Microsoft YaHei', 12),
             wrap=tk.WORD
         )
         self.info_text.pack(fill=tk.BOTH, expand=True)
+        self._vpaned.add(txt_box, weight=2)
 
         # ===== 可视化按钮区域 =====
         viz_frame = ttk.Frame(main_frame)
-        viz_frame.grid(row=3, column=0, sticky="ew", pady=10)
+        viz_frame.grid(row=3, column=0, sticky="ew", pady=6)
 
         self.visualize_btn = ttk.Button(
             viz_frame,
@@ -1398,33 +1424,90 @@ class MoleculeApp:
     # ----------------------------------------------------------------
 
     def _build_group_panel(self, parent):
-        """基团构建模式面板：勾选基团 → 「碳骨架 + 基团挂载」构建（非完备但极快）"""
+        """基团构建模式面板：**默认折叠**（只占一行），点开关展开
+
+        折叠原因（UI 诊断）：11 个基团 + 提示文案会把顶部请求高度推到 ~345px，
+        在 900x700 等非最大化窗口下把结果区压到只剩 150px，导致分子显示框不可见。
+        展开后内部按当前宽度**流式换行**，提示文案的折行宽度随面板宽度自适应。
+        """
         try:
             from special_groups import list_groups
         except Exception:
             return
-        lf = ttk.LabelFrame(parent, text="基团构建模式（快速 · 非完备）",
-                            padding="6")
-        lf.pack(fill=tk.X, pady=(2, 4))
-        row = None
-        for i, g in enumerate(list_groups()):
-            if i % 6 == 0:
-                row = ttk.Frame(lf)
-                row.pack(fill=tk.X, anchor='w')
+
+        # ── 开关行（常驻，仅一行高）──
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, pady=(2, 2))
+        self._group_toggle_var = tk.BooleanVar(value=False)
+        self._group_toggle_btn = tk.Checkbutton(
+            bar, text="基团构建模式（快速 · 非完备）",
+            variable=self._group_toggle_var, command=self._on_group_toggle)
+        self._group_toggle_btn.pack(side=tk.LEFT)
+        self._group_summary = ttk.Label(bar, text="未选择基团", foreground='#888888')
+        self._group_summary.pack(side=tk.LEFT, padx=(10, 0))
+
+        # ── 折叠内容（默认不 pack）──
+        self._group_body = ttk.LabelFrame(parent, padding="6")
+        flow = ttk.Frame(self._group_body)
+        flow.pack(fill=tk.X)
+        self._group_flow_children = []
+        for g in list_groups():
             var = tk.BooleanVar(value=False)
             cnt = tk.IntVar(value=1)
             self.group_vars[g.key] = (var, cnt)
-            ttk.Checkbutton(row, text=g.name, variable=var).pack(
-                side=tk.LEFT, padx=(2, 0))
-            ttk.Spinbox(row, from_=1, to=3, width=2, textvariable=cnt).pack(
-                side=tk.LEFT, padx=(0, 6))
-        ttk.Label(
-            lf,
+            cb = ttk.Checkbutton(flow, text=g.name, variable=var,
+                                 command=self._update_group_summary)
+            sp = ttk.Spinbox(flow, from_=1, to=3, width=2,
+                             textvariable=cnt, command=self._update_group_summary)
+            self._group_flow_children += [cb, sp]
+        flow.bind('<Configure>',
+                  lambda e: self._flow_widgets(flow, self._group_flow_children))
+        self._group_hint = ttk.Label(
+            self._group_body,
             text=("勾选后走「碳骨架 + 所选基团」构建：秒级出结果"
                   "（例 C6H5NO2 + 硝基 → 硝基苯）；"
-                  "不含杂原子在环内/链中的结构（吡啶、环氧等）。"),
-            foreground='#555555', wraplength=820,
-            justify='left').pack(anchor='w', pady=(3, 0))
+                  "不含杂原子位于环内/链中的结构（吡啶、环氧等），"
+                  "完整枚举请取消勾选。"),
+            foreground='#555555', justify='left', wraplength=600)
+        self._group_hint.pack(anchor='w', pady=(3, 0))
+        self._group_body.bind('<Configure>', self._on_group_body_configure)
+
+    def _on_group_toggle(self):
+        """展开 / 收起基团面板"""
+        try:
+            if self._group_toggle_var.get():
+                self._group_body.pack(fill=tk.X, pady=(2, 4))
+                # 内容宽度确定后再流式重排一次
+                self.root.after(30, lambda: self._flow_widgets(
+                    self._group_flow_children[0].master, self._group_flow_children))
+            else:
+                self._group_body.pack_forget()
+        except tk.TclError:
+            pass
+        self._update_group_summary()
+
+    def _update_group_summary(self):
+        """更新开关行右侧的"已选基团"摘要"""
+        try:
+            sel = self._selected_groups()
+            if not sel:
+                self._group_summary.config(text="未选择基团", foreground='#888888')
+            else:
+                from special_groups import GROUP_LIBRARY
+                txt = "、".join(f"{GROUP_LIBRARY[k].name}×{v}"
+                               for k, v in sorted(sel.items()))
+                self._group_summary.config(text=f"已选: {txt}", foreground='#b45f06')
+        except Exception:
+            pass
+
+    def _on_group_body_configure(self, event=None):
+        """面板宽度变化 → 提示文案折行宽度跟随（避免固定 820px 撑宽窗口）"""
+        try:
+            w = self._group_body.winfo_width()
+            if w > 100:
+                self._group_hint.config(wraplength=max(240, w - 24))
+        except tk.TclError:
+            pass
 
     def _selected_groups(self):
         """当前勾选的基团 ``{key: 个数}``（未勾选返回空 dict）"""
@@ -3069,7 +3152,13 @@ class MoleculeApp:
             pass  # 窗口已关闭
 
     def _render_skeletal_image(self, isomer_data, mol_type):
-        """渲染并显示分子的键线式图片"""
+        """渲染并显示分子的键线式图片
+
+        渲染尺寸取 **Canvas 实际尺寸**（窗口/分栏调整后更清晰）：
+        尺寸变化由 ``_on_canvas_configure`` 节流触发重绘。
+        """
+        # 记住当前详情，供"画布尺寸变化后重绘"复用
+        self._current_detail = (isomer_data, mol_type)
         # 清除旧图片，释放内存
         self._formula_canvas.delete("all")
         self._formula_photo = None
@@ -3082,13 +3171,24 @@ class MoleculeApp:
             self._show_skeletal_placeholder("键线式渲染不可用\n请安装: pip install cairosvg Pillow")
             return
 
+        # 按 Canvas 实际尺寸渲染（Tk 尺寸必须在此处主线程读取）
+        try:
+            cw = self._formula_canvas.winfo_width()
+            ch = self._formula_canvas.winfo_height()
+        except tk.TclError:
+            cw = ch = 0
+        if cw < 60 or ch < 40:
+            cw, ch = 380, 220
+        img_size = (int(cw), int(ch))
+        self._last_canvas_size = (cw, ch)
+
         # 在后台线程中生成图片（避免阻塞 UI）
         def _render_in_thread():
             try:
                 png_data = render_skeletal_formula(
                     isomer_data, mol_type,
                     gen_mgr=self.gen_mgr,
-                    img_size=(380, 220)
+                    img_size=img_size
                 )
                 if png_data is None:
                     self.root.after(0, self._show_skeletal_placeholder, "键线式渲染不可用")
@@ -3116,17 +3216,18 @@ class MoleculeApp:
 
             from PIL import Image, ImageTk
 
-            # 获取 Canvas 实际宽度，适配缩放
+            # 取 Canvas 实际尺寸（宽高都参与缩放，垂直居中）
             canvas_w = self._formula_canvas.winfo_width()
-            if canvas_w < 50:
-                canvas_w = 380
+            canvas_h = self._formula_canvas.winfo_height()
+            if canvas_w < 50 or canvas_h < 40:
+                canvas_w, canvas_h = 380, 220
 
-            # 等比缩放
+            # 等比缩放（尽量铺满画布，避免放大失真）
             w, h = pil_img.size
-            scale = min(canvas_w / w, 200 / h, 1.0)
+            scale = min(canvas_w / w, canvas_h / h, 1.0)
             if scale < 1.0:
-                new_w = int(w * scale)
-                new_h = int(h * scale)
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
                 pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
             self._formula_photo = ImageTk.PhotoImage(pil_img)
@@ -3134,13 +3235,160 @@ class MoleculeApp:
             # 居中放置
             self._formula_canvas.delete("all")
             self._formula_canvas.create_image(
-                canvas_w // 2, 100,
+                canvas_w // 2, canvas_h // 2,
                 image=self._formula_photo,
                 anchor=tk.CENTER
             )
 
         except Exception:
             self._show_skeletal_placeholder("键线式渲染不可用")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 可拖拽分栏 / 键线式尺寸自适应 / 布局记忆
+    # ═══════════════════════════════════════════════════════════════
+
+    def _on_canvas_configure(self, event=None):
+        """Canvas 尺寸变化 → 节流 300ms 后按新尺寸重绘键线式
+
+        拖动分隔条/缩放窗口时会连续触发 Configure，必须节流，否则会反复渲染。
+        """
+        try:
+            w = self._formula_canvas.winfo_width()
+            h = self._formula_canvas.winfo_height()
+        except tk.TclError:
+            return
+        if w < 60 or h < 40:
+            return
+        if abs(w - self._last_canvas_size[0]) < 12 and \
+                abs(h - self._last_canvas_size[1]) < 12:
+            return
+        if self._current_detail is None:
+            return
+        if self._canvas_resize_job is not None:
+            try:
+                self.root.after_cancel(self._canvas_resize_job)
+            except Exception:
+                pass
+        self._canvas_resize_job = self.root.after(
+            300, self._rerender_current_skeletal)
+
+    def _rerender_current_skeletal(self):
+        """按当前画布尺寸重绘键线式（节流回调）"""
+        self._canvas_resize_job = None
+        if self._current_detail is None or self.window_closed:
+            return
+        try:
+            self._render_skeletal_image(*self._current_detail)
+        except Exception:
+            pass
+
+    def _on_paned_double_click(self, event=None):
+        """双击分隔条 → 恢复默认比例（左右 62% / 上下 60%）"""
+        try:
+            for paned, ratio in ((getattr(self, '_hpaned', None), 0.62),
+                                 (getattr(self, '_vpaned', None), 0.60)):
+                if paned is None:
+                    continue
+                try:
+                    total = (paned.winfo_width()
+                             if str(paned.cget('orient')) == 'horizontal'
+                             else paned.winfo_height())
+                except tk.TclError:
+                    continue
+                if total > 120:
+                    paned.sashpos(0, int(total * ratio))
+        except tk.TclError:
+            pass
+
+    def _layout_path(self):
+        """布局配置文件路径：``~/.hydrocarbon_generator/ui_layout.json``"""
+        from pathlib import Path
+        p = Path.home() / '.hydrocarbon_generator'
+        p.mkdir(parents=True, exist_ok=True)
+        return p / 'ui_layout.json'
+
+    def _save_layout(self):
+        """保存窗口尺寸 + 两个分隔条位置（关闭窗口时调用，失败静默）"""
+        try:
+            import json
+            data = {'geometry': self.root.geometry()}
+            try:
+                data['h_sash'] = int(self._hpaned.sashpos(0))
+            except Exception:
+                pass
+            try:
+                data['v_sash'] = int(self._vpaned.sashpos(0))
+            except Exception:
+                pass
+            with open(self._layout_path(), 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _restore_layout(self):
+        """启动时恢复上次布局（只恢复**尺寸**，忽略窗口位置，避免跑出屏幕）"""
+        try:
+            import json
+            p = self._layout_path()
+            if not p.exists():
+                return
+            data = json.loads(p.read_text(encoding='utf-8'))
+            geo = data.get('geometry')
+            if isinstance(geo, str) and 'x' in geo:
+                size = geo.split('+')[0]
+                try:
+                    w, h = (int(v) for v in size.split('x'))
+                    self.root.geometry(f"{max(w, 880)}x{max(h, 620)}")
+                except Exception:
+                    pass
+            self._layout_saved_sash = (data.get('h_sash'), data.get('v_sash'))
+        except Exception:
+            pass
+
+    def _init_panes(self, attempt=0):
+        """首次映射后设置分隔条初始位置
+
+        ⚠ 不能依赖子控件"请求尺寸"：Canvas 请求只有 1px，会让上栏塌成一条缝。
+        默认比例：左右 62% / 上下 60%；有保存值则优先用保存值（越界自动回退）。
+        """
+        try:
+            if self.window_closed or self._layout_restored:
+                return
+            h_saved, v_saved = self._layout_saved_sash or (None, None)
+            ok_h = ok_v = False
+
+            try:
+                total = self._hpaned.winfo_width()
+                if total > 320:
+                    target = h_saved if (h_saved and 60 < h_saved < total - 60) \
+                        else int(total * 0.62)
+                    self._hpaned.sashpos(0, max(240, min(target, total - 240)))
+                    ok_h = True
+            except tk.TclError:
+                pass
+
+            try:
+                total = self._vpaned.winfo_height()
+                if total > 120:
+                    if total < 160:
+                        # 空间很小时对半分（保证上下都可见）；避免越界钳制
+                        target = max(40, total // 2)
+                    else:
+                        target = v_saved if (v_saved and 40 < v_saved < total - 40) \
+                            else int(total * 0.60)
+                        target = max(70, min(target, total - 70))
+                    self._vpaned.sashpos(0, target)
+                    ok_v = True
+            except tk.TclError:
+                pass
+
+            if ok_h and ok_v:
+                self._layout_restored = True
+                return
+            if attempt < 6:
+                self.root.after(150, lambda: self._init_panes(attempt + 1))
+        except tk.TclError:
+            pass
 
     def _on_formula_canvas_right_click(self, event):
         """右键弹出菜单：复制图像 / 另存为"""
