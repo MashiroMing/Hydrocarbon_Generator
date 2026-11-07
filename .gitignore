@@ -36,3 +36,10 @@ chemistry-and-biology/
 # Third-party external tools (clone upstream separately)
 MAYGEN/
 
+# Third-party skill packs kept locally for reference only.
+# They carry no LICENSE file, so they must not be redistributed via this repo.
+# Re-fetch from upstream when needed:
+#   learningmatter-mit/AtomisticSkills · l3digital-net/claude-code-plugins
+#   SciMate-AI/HPC-Skills
+skills/
+

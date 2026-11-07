@@ -97,6 +97,14 @@ a = Analysis(
         'original_programs.multcycloalkane',
         'original_programs.cyclopolyene_generator',
         'molecular_constants',
+        # 含氮模块包（GUI 生成路径：Main.py → Nitrogen → AtomicMatrixNGenerator）
+        'Nitrogen',
+        'Nitrogen.formula',
+        'Nitrogen.atomic_matrix_n',
+        'Nitrogen.generator',
+        'Nitrogen.oracle_cache',
+        'special_groups',
+        'group_builder',
         # tkinter
         'tkinter',
         'tkinter.filedialog',

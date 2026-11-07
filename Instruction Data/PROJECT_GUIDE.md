@@ -10,7 +10,9 @@
 本工具用于有机化学异构体的**生成、去重、3D/2D 可视化**及 **Gaussian 输入文件（.gjf）导出**。
 
 - 支持**烃类**（烷、烯、炔、二烯、环烷、环烯、多烯、多环等）、**卤代烃**（F/Cl/Br/I 取代）、**含氧衍生物**（醇/酚/醚/醛/酮/羧酸/酯及含 O 杂环）和**含氮化合物**（胺/腈/亚胺/偶氮/含 N 杂环）的自动枚举。
-  > 注：含氮模块 `Nitrogen/` 目前为**独立库 / CLI**，尚未接入 GUI（详见 §4.11）。
+  > 注：含氮模块 `Nitrogen/` **已接入 GUI（第一期 2026-09-21 生成/浏览；
+  > 第二期 2026-09-21 补齐键线式 / 3D / `.gjf` 导出；第三期 2026-09-21 支持
+  > N+O 组合与预言机并行化）**；详见 §4.11。
 - **GUI**：Tkinter 实现，支持分子式输入、类型筛选、高级结构约束筛选、列表选择、3D 交互（matplotlib）和键线式渲染（RDKit）。
 - **核心引擎**：`GeneratorManager` 统一调度；烷烃使用专用生成器，其他类型使用 `RobustPolycyclicPolyeneGenerator`（基于图论枚举）。
 - **数据表示**：所有分子以 `networkx.Graph` 存储，节点和边携带化学属性。
@@ -332,12 +334,53 @@ GUI 结果列表精细筛选用（含氧时显示）：`classify(G) -> frozenset
 
 ---
 
-### 4.11 含氮生成模块 (Nitrogen/) — 独立库 / CLI
+### 4.11 含氮生成模块 (Nitrogen/) — 已接入 GUI（第一/二/三期）
 
 > N 系专项细节以 `Nitrogen/README_NITROGEN.md` 为准；本节只列与主项目相关的接口与口径。
 
 **状态**：纯 C/H/N 有机物（胺 / 腈 / 亚胺 / 偶氮 / 含 N 杂环）的**完备枚举**已实现，
-**尚未接入 GUI**（`Main.py` 未导入该模块），当前通过 CLI 使用：
+并**已于 2026-09-21 接入 GUI（第一期）**：
+
+- **生成**：`Main.py._generate_in_background` 的含氮分支调用 `AtomicMatrixNGenerator`
+  （预言机，实测比树机制更快且完备）；重原子数上限 **10**，`nC+nN ≥ 7` 时弹耗时确认框。
+- **展示**：列表 / 状态栏 / 结构信息面板（分子式含 `N{n}`、C/N/H 分列统计）；
+  类型筛选出「全部 / 含氮化合物」。
+- **渲染与导出（第二期，2026-09-21 已支持）**：键线式 2D、3D 可视化、`.gjf` 导出
+  全部解禁，与烃 / 含氧 / 卤代共用同一链路。关键改动（详见 `开发过程.md` §十四）：
+  1. `utils.graph_to_rdkit_mol` 新增元素价态表 `_ELEMENT_VALENCE = {C:4, N:3, O:2}`
+     （替换原「非 C 即 2 价」写法；C/O 取值与原实现一致，故旧路径逐位不变）；
+  2. `Main._build_rdkit_mol` 把 `label='N'` 建为 3 价氮原子（其余 label 仍建为碳，
+     不动含氧/卤代既有行为）；`_extract_coords` 改为收集**全部重原子**（非氢）；
+  3. `Main._parallel_compute_coords` 新增 `'nitrogen'` 分支
+     （`_rdkit_coords_with_bonds(G, double_only=False)`，处理双/三键与环）；
+  4. `gaussian_export.build_gjf` **坐标段按元素渲染**（原实现硬编码 `'C'`，
+     含杂原子会把 N 写成碳）；
+  5. `_generate_gjf_content` / 导出文件名对含氮使用统一事实源 `format_graph_formula(G)`
+     （原 `compute_formula` 不覆盖 `'nitrogen'`，标题会写成 `C2H?`）；
+  6. `_visualize_current` 新增 `'nitrogen'` 分派 + 新增 `_visualize_nitrogen`
+     （C 黑 / **N 蓝并标注元素符号**、C–N 键一并绘制）；未覆盖类型改为**明确提示**
+     （原实现是静默无反应）。
+- **约束**：**{N, O, 卤素} 任意组合均已支持**（2026-09-21 起，互斥**全部解除**）：
+  含氮骨架由预言机枚举（C=4 / N=3 / O=2），卤素随后按"取代 H"后处理
+  （`HalogenSubstitutionGenerator`，可用位按元素价态计算）。
+- **特殊基团库**（`special_groups.py`，2026-09-21）：硝基 / 亚硝基 / 叠氮等
+  **超出中性八隅律**或需电荷分离式的基团，**按需挂载**（`attach_group`），
+  可正常 2D/3D 渲染与 `.gjf` 导出，但**不进枚举**（进枚举会改变全部 N 系基线）。
+  价态口径扩展为「基准价 + 形式电荷（带符号）」。
+- **路线 A：N+O 组合（第三期，2026-09-21）**：预言机扩到 C/N/O（C=4 / N=3 / O=2），
+  `parse_compound_formula` 解除 N+O 互斥、`AtomicMatrixNGenerator(nC, nN, nO)`、
+  有序生成升为三计数器。15 个 N+O 公式经 MAYGEN 一次性对拍 **0 缺 0 多**
+  （`INTERNAL_BASELINE_NO` 已固化为回归锁）。详见 `开发过程.md` §十五。
+  > ⚠ **硝基 –NO₂ 不在空间内**（N=3 中性八隅律）；与 MAYGEN 默认价态一致，非缺失。
+- **预言机并行化（第三期同轮）**：`generate_for_target_h_parallel()`
+  —— 前缀切分（`enumerate_prefixes` + `_replay_prefix`）→ 进程池 → 父进程
+  **WL + VF2 跨子树去重**。小公式经探测自动留在串行（进程池启动 ~8~9 s），
+  C6H5N 实测 **1.9~2.8×**。GUI 含氮分支已切到并行入口。
+
+接入时为共享事实源新增 `utils.graph_formula_parts_full(G) → (nC,nH,nN,nO,halo)`，
+`parse_compound_formula` 返回值扩展为 **8 元组**（末位 `n_nitrogen`）。
+
+CLI 仍可用：
 
 ```bash
 python -m Nitrogen.validate --anchors     # 六项内部验证（约 2.5 分钟）
@@ -472,7 +515,7 @@ python -m Nitrogen.validate C5H5N         # 指定分子式（样例 + 锚点 + 
 - `oxygen/funcgroup.py`：含氧官能团分类模块（GUI 精细筛选用，见 4.10）。
 - `O_project_guide.md`：**含氧生成专项总结**（化学口径 / 生成机制 / 去重验证 / 性能 /
   踩坑分类收录 / N、P 扩展蓝图），扩展 N/P 元素前必读——本文档含氧细节从简，见该文件。
-- `Nitrogen/`：**含氮化合物生成模块**（独立库 / CLI，**尚未接入 GUI**）——
+- `Nitrogen/`：**含氮化合物生成模块**（**已接入 GUI，第一期**；见 §4.11）——
   `formula.py`（公式与价态单一事实源）/ `atomic_matrix_n.py`（完备性预言机）/
   `generator.py`（树机制生成器）/ `validate.py`（六项内部验证入口）/
   `maygen_compare.py`（**可选** MAYGEN 外部对照，不参与回归）。

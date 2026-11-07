@@ -56,6 +56,14 @@ a = Analysis(
         'utils',
         'molecular_constants',
         'gaussian_export',
+        # 含氮模块包（GUI 生成路径：Main.py → Nitrogen → AtomicMatrixNGenerator）
+        'Nitrogen',
+        'Nitrogen.formula',
+        'Nitrogen.atomic_matrix_n',
+        'Nitrogen.generator',
+        'Nitrogen.oracle_cache',
+        'special_groups',
+        'group_builder',
         # 卤素/含氧模块包
         'halogen.Halide',
         'oxygen.oxo_generator',
