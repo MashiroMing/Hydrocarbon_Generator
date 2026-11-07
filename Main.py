@@ -975,14 +975,14 @@ class MoleculeApp:
     def _create_widgets(self):
         """创建界面组件"""
         # 主容器（使用 grid 确保底部按钮始终可见）
-        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame = ttk.Frame(self.root, padding="8")
         main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.rowconfigure(2, weight=1)  # 只有结果区域可伸缩
         main_frame.columnconfigure(0, weight=1)
 
         # ===== 标题区域 =====
         title_frame = ttk.Frame(main_frame)
-        title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        title_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
         # 三列布局：左弹性 | 标题居中 | 按钮右对齐
         title_frame.columnconfigure(0, weight=1)
@@ -1111,7 +1111,7 @@ class MoleculeApp:
 
         # ===== 结果显示区域：左右**可拖拽**分栏（ttk.PanedWindow）=====
         result_frame = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        result_frame.grid(row=2, column=0, sticky="nsew", pady=6)
+        result_frame.grid(row=2, column=0, sticky="nsew", pady=4)
         self._hpaned = result_frame
         result_frame.bind('<Double-Button-1>', self._on_paned_double_click)
 
@@ -1216,11 +1216,7 @@ class MoleculeApp:
         info_frame = ttk.LabelFrame(result_frame, text="分子信息", padding="5")
         result_frame.add(info_frame, weight=1)
 
-        # 占位行，与左侧筛选行等高，使浅色内容区顶部对齐
-        info_spacer = ttk.Frame(info_frame, height=24)
-        info_spacer.pack(fill=tk.X, pady=(0, 5))
-        info_spacer.pack_propagate(False)
-
+        # 键线式/信息区直接占满（原 24px 占位行已移除：为常用基团面板腾出高度）
         self._vpaned = ttk.PanedWindow(info_frame, orient=tk.VERTICAL)
         self._vpaned.pack(fill=tk.BOTH, expand=True)
         self._vpaned.bind('<Double-Button-1>', self._on_paned_double_click)
@@ -1264,7 +1260,7 @@ class MoleculeApp:
 
         # ===== 可视化按钮区域 =====
         viz_frame = ttk.Frame(main_frame)
-        viz_frame.grid(row=3, column=0, sticky="ew", pady=6)
+        viz_frame.grid(row=3, column=0, sticky="ew", pady=4)
 
         self.visualize_btn = ttk.Button(
             viz_frame,
@@ -1424,30 +1420,30 @@ class MoleculeApp:
     # ----------------------------------------------------------------
 
     def _build_group_panel(self, parent):
-        """基团构建模式面板：**默认折叠**（只占一行），点开关展开
+        """**常用基团**快速构建面板：默认**展开**（可见 11 个基团），可折叠
 
-        折叠原因（UI 诊断）：11 个基团 + 提示文案会把顶部请求高度推到 ~345px，
-        在 900x700 等非最大化窗口下把结果区压到只剩 150px，导致分子显示框不可见。
-        展开后内部按当前宽度**流式换行**，提示文案的折行宽度随面板宽度自适应。
+        历史：§十七 首次加入时是常驻展开的；§十九 布局重构时改为默认折叠，
+        用户反馈"常见基团丢了" → 恢复为**默认展开**，同时保持紧凑（流式换行 +
+        单行提示），折叠状态写入布局配置，下次启动沿用。
         """
         try:
             from special_groups import list_groups
         except Exception:
             return
 
-        # ── 开关行（常驻，仅一行高）──
+        # ── 开关行（常驻）──
         bar = ttk.Frame(parent)
-        bar.pack(fill=tk.X, pady=(2, 2))
-        self._group_toggle_var = tk.BooleanVar(value=False)
+        bar.pack(fill=tk.X, pady=(1, 0))
+        self._group_toggle_var = tk.BooleanVar(value=True)   # 默认展开
         self._group_toggle_btn = tk.Checkbutton(
-            bar, text="基团构建模式（快速 · 非完备）",
+            bar, text="常用基团（快速构建 · 非完备）",
             variable=self._group_toggle_var, command=self._on_group_toggle)
         self._group_toggle_btn.pack(side=tk.LEFT)
         self._group_summary = ttk.Label(bar, text="未选择基团", foreground='#888888')
         self._group_summary.pack(side=tk.LEFT, padx=(10, 0))
 
-        # ── 折叠内容（默认不 pack）──
-        self._group_body = ttk.LabelFrame(parent, padding="6")
+        # ── 基团内容（流式换行，默认展开）──
+        self._group_body = ttk.LabelFrame(parent, padding="2")
         flow = ttk.Frame(self._group_body)
         flow.pack(fill=tk.X)
         self._group_flow_children = []
@@ -1462,15 +1458,15 @@ class MoleculeApp:
             self._group_flow_children += [cb, sp]
         flow.bind('<Configure>',
                   lambda e: self._flow_widgets(flow, self._group_flow_children))
+        # 单行短提示（完整说明保留在开发文档，避免撑高/撑宽）
         self._group_hint = ttk.Label(
             self._group_body,
-            text=("勾选后走「碳骨架 + 所选基团」构建：秒级出结果"
-                  "（例 C6H5NO2 + 硝基 → 硝基苯）；"
-                  "不含杂原子位于环内/链中的结构（吡啶、环氧等），"
+            text=("⚠ 非完备：仅「碳骨架 + 所选基团」，不含杂原子在环内/链中的结构；"
                   "完整枚举请取消勾选。"),
-            foreground='#555555', justify='left', wraplength=600)
-        self._group_hint.pack(anchor='w', pady=(3, 0))
+            foreground='#666666', justify='left', wraplength=900)
+        self._group_hint.pack(anchor='w', pady=(2, 0))
         self._group_body.bind('<Configure>', self._on_group_body_configure)
+        self._group_body.pack(fill=tk.X, pady=(1, 2))
 
     def _on_group_toggle(self):
         """展开 / 收起基团面板"""
@@ -3320,6 +3316,10 @@ class MoleculeApp:
                 data['v_sash'] = int(self._vpaned.sashpos(0))
             except Exception:
                 pass
+            try:
+                data['group_open'] = bool(self._group_toggle_var.get())
+            except Exception:
+                pass
             with open(self._layout_path(), 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False)
         except Exception:
@@ -3342,6 +3342,15 @@ class MoleculeApp:
                 except Exception:
                     pass
             self._layout_saved_sash = (data.get('h_sash'), data.get('v_sash'))
+            # 常用基团面板的展开状态（默认展开）
+            if 'group_open' in data:
+                want = bool(data.get('group_open'))
+                try:
+                    if bool(self._group_toggle_var.get()) != want:
+                        self._group_toggle_var.set(want)
+                        self._on_group_toggle()
+                except Exception:
+                    pass
         except Exception:
             pass
 
