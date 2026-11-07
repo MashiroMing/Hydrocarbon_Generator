@@ -17,7 +17,8 @@ import re
 import networkx as nx
 from typing import List, Dict, Tuple
 
-from utils import _dedup_canon_key, _dedup_degree_signature, dedup_add_to_buckets
+from utils import (_dedup_canon_key, _dedup_degree_signature,
+                   dedup_add_to_buckets, atom_valence)
 
 # 卤素元组索引: (F, Cl, Br, I)
 HALOGEN_INDEX = {'F': 0, 'Cl': 1, 'Br': 2, 'I': 3}
@@ -162,11 +163,17 @@ class HalogenSubstitutionGenerator:
     # ==================== 辅助计算 ====================
 
     def _compute_available_h(self, G: nx.Graph) -> List[int]:
-        """计算每个节点可用的H位置数（C=4, O=2，含 oxo_counts 修正）"""
+        """计算每个节点可用的H位置数（**按元素价态** + oxo_counts 修正）
+
+        价态口径与 ``utils._ELEMENT_VALENCE`` **保持一致**（C=4 / N=3 / O=2 /
+        卤素=1），并按节点的 ``formal_charge`` 带符号修正：
+        阴离子少成键、阳离子多成键（特殊基团如硝基电荷分离式需要）。
+        卤素本身已被取代，不再提供位置（其可用 H 为 0）。
+        """
         available = []
         for node in sorted(G.nodes()):
             label = G.nodes[node].get('label', 'C')
-            max_valence = 2 if label == 'O' else 4
+            max_valence = atom_valence(label, G.nodes[node])
 
             bond_load = self._bond_load(G, node)
             n_db = self._count_double_bonds(G, node)

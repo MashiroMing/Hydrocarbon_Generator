@@ -103,8 +103,34 @@ def _seen_add(seen: Dict[str, List[nx.Graph]], wh: str,
     results.append(G)
 
 
-# ============ 主生成器 ============
+#: 进程池启动成本估计（秒）——Windows/spawn 下每个 worker 需重新 import 依赖，
+#: 本机实测 8 workers ≈ 8~9 s。串行总成本低于 ``_POOL_STARTUP_SEC × _POOL_MIN_GAIN``
+#: 时自动留在串行（并行反而更慢）。
+_POOL_STARTUP_SEC = 8.0
+_POOL_MIN_GAIN = 3.0
 
+
+def _wl_hash_from_graph(G: nx.Graph) -> str:
+    """图的 WL 哈希（父进程跨子树合并去重；桶内仍用 VF2 精确确证）"""
+    return nx.weisfeiler_lehman_graph_hash(G, node_attr='label',
+                                           edge_attr='bond_type')
+
+
+def _oracle_prefix_worker_o(args):
+    """进程池 worker（顶层函数，可 pickle）：枚举**一个前缀子树**的唯一图
+
+    args = (n_carbon, n_oxygen, target_h, prefix, max_atoms, deadline)
+    """
+    n_c, n_o, target_h, prefix, max_atoms, deadline = args
+    gen = AtomicMatrixGenerator(n_c, n_o, max_atoms=max_atoms)
+    try:
+        return gen.generate_for_target_h(target_h, deadline=deadline,
+                                         prefix=tuple(prefix))
+    except TimeoutError:
+        return []
+
+
+# ============ 主生成器 ============
 class AtomicMatrixGenerator:
     """原子级邻接矩阵补漏生成器"""
 
@@ -163,7 +189,8 @@ class AtomicMatrixGenerator:
         return dict(buckets)
 
     def generate_for_target_h(self, target_h: int,
-                              deadline: Optional[float] = None) -> List[nx.Graph]:
+                              deadline: Optional[float] = None,
+                              prefix: Tuple[int, ...] = ()) -> List[nx.Graph]:
         """生成 H 原子数恰为 target_h 的全部连通、价态合法图（目标键级剪枝）
 
         数学上完备（与 MAYGEN 等价）：邻接矩阵枚举 + 目标 H 键级总和剪枝，
@@ -211,6 +238,12 @@ class AtomicMatrixGenerator:
         row_sums = [0] * N
         results: List[nx.Graph] = []
         seen: Dict[str, List[nx.Graph]] = {}   # WL 哈希 → 图列表（冲突时同构判定）
+
+        # ── 前缀回放（并行切分用）：固定 pos 0..len(prefix)-1 的取值 ──
+        _st = self._replay_prefix(prefix, M, row_sums, pos_max_bond, last_pos)
+        if _st is None:
+            return []
+        p_start, used_valence0, nz_bonds0, cc0, co0 = _st
 
         def max_future_valence(pos_idx: int) -> int:
             """剩余位置可贡献的最大价（乐观上界，用于"到不了"剪枝）"""
@@ -314,8 +347,165 @@ class AtomicMatrixGenerator:
                               n_conn_c, n_conn_o)
                     M[i][j] = M[j][i] = 0
 
-        backtrack(0, 0, 0, 0, 0)
+        backtrack(p_start, used_valence0, nz_bonds0, cc0, co0)
         return results
+
+    # ── 前缀机制（并行切分的基础；与 Nitrogen/atomic_matrix_n.py 同一套设计）──
+
+    def _precompute(self):
+        """预计算：每位置最大键级 + 每原子最后出现位置（连通剪枝用）"""
+        pos_max_bond = [0] * self.num_positions
+        last_pos = [0] * self.N
+        for p in range(self.num_positions):
+            i, j = self._position_to_indices(p)
+            pos_max_bond[p] = _max_bond_type(self.atom_types[i],
+                                             self.atom_types[j])
+            last_pos[i] = max(last_pos[i], p)
+            last_pos[j] = max(last_pos[j], p)
+        return pos_max_bond, last_pos
+
+    def _replay_prefix(self, prefix, M, row_sums, pos_max_bond, last_pos):
+        """把 prefix 回放到矩阵状态（与主回溯同一套规则 → 单一事实源）
+
+        Returns:
+            ``(p_start, used_valence, nz_bonds, n_conn_c, n_conn_o)`` 或 ``None``
+        """
+        if len(prefix) > self.num_positions:
+            return None
+        N = self.N
+        used = nz = cc = co = 0
+        for p, bt in enumerate(prefix):
+            i, j = self._position_to_indices(p)
+            mb = pos_max_bond[p]
+            if self.atom_types[i] == 'O' and self.atom_types[j] == 'O':
+                _oo = 0
+                for _k in range(N):
+                    if self.atom_types[_k] == 'O' and M[i][_k] > 0:
+                        _oo += 1
+                    if self.atom_types[_k] == 'O' and M[j][_k] > 0:
+                        _oo += 1
+                if _oo >= 2:
+                    mb = 0
+            if bt < 0 or bt > mb:
+                return None
+            bv = _bond_valence(bt)
+            i_new = (row_sums[i] == 0)
+            j_new = (row_sums[j] == 0)
+            if bt > 0:
+                if (row_sums[i] + bv > self.valences[i]
+                        or row_sums[j] + bv > self.valences[j]):
+                    return None
+                if not (i_new and j_new):
+                    if i_new:
+                        if (i < self.n_carbon and i != cc) or \
+                           (i >= self.n_carbon and i != self.n_carbon + co):
+                            return None
+                    if j_new:
+                        if (j < self.n_carbon and j != cc) or \
+                           (j >= self.n_carbon and j != self.n_carbon + co):
+                            return None
+                M[i][j] = M[j][i] = bt
+                row_sums[i] += bv
+                row_sums[j] += bv
+                used += 2 * bv
+                nz += 1
+                cc += (1 if i_new and i < self.n_carbon else 0) + \
+                      (1 if j_new and j < self.n_carbon else 0)
+                co += (1 if i_new and i >= self.n_carbon else 0) + \
+                      (1 if j_new and j >= self.n_carbon else 0)
+            else:
+                if row_sums[i] == 0 and last_pos[i] == p:
+                    return None
+                if row_sums[j] == 0 and last_pos[j] == p:
+                    return None
+        return len(prefix), used, nz, cc, co
+
+    def enumerate_prefixes(self, depth: int) -> List[Tuple[int, ...]]:
+        """枚举全部**通过校验**的深度 ``depth`` 前缀（互不重叠，并集覆盖全空间）"""
+        depth = max(0, min(int(depth), self.num_positions))
+        if depth == 0:
+            return [()]
+        pos_max_bond, last_pos = self._precompute()
+        out: List[Tuple[int, ...]] = []
+
+        def rec(p: int, prefix: Tuple[int, ...]) -> None:
+            if p == depth:
+                out.append(prefix)
+                return
+            i, j = self._position_to_indices(p)
+            for bt in range(_max_bond_type(self.atom_types[i],
+                                           self.atom_types[j]) + 1):
+                cand = prefix + (bt,)
+                if self._replay_prefix(cand,
+                                       [[0] * self.N for _ in range(self.N)],
+                                       [0] * self.N, pos_max_bond,
+                                       last_pos) is not None:
+                    rec(p + 1, cand)
+
+        rec(0, ())
+        return out
+
+    def generate_for_target_h_parallel(self, target_h: int,
+                                       max_workers: Optional[int] = None,
+                                       split_depth: Optional[int] = None,
+                                       deadline: Optional[float] = None
+                                       ) -> List[nx.Graph]:
+        """**并行版** generate_for_target_h（前缀切分 + 进程池 + 父进程去重）
+
+        与串行版结果**逐元素一致**（只差顺序）；进程池不可用时可见告警后串行兜底。
+        详见 `Instruction Data/开发过程.md` §15.3。
+        """
+        import os
+        if max_workers is None:
+            max_workers = min(8, os.cpu_count() or 4)
+        if max_workers <= 1 or self.num_positions <= 2:
+            return self.generate_for_target_h(target_h, deadline=deadline)
+
+        if split_depth is None:
+            # 深度硬上限 4（前缀枚举本身必须廉价）；目标 ≈2×workers
+            best_depth, best_n = 1, len(self.enumerate_prefixes(1))
+            for d in (2, 3, 4):
+                if d >= self.num_positions or best_n >= 2 * max_workers:
+                    break
+                n_d = len(self.enumerate_prefixes(d))
+                if n_d > best_n:
+                    best_depth, best_n = d, n_d
+            split_depth = best_depth
+        prefixes = self.enumerate_prefixes(split_depth)
+        if len(prefixes) <= 1:
+            return self.generate_for_target_h(target_h, deadline=deadline)
+
+        # 探测一个子树估算串行总成本；小公式不开池（spawn 启动 ~8s）
+        _t0 = time.time()
+        first = self.generate_for_target_h(target_h, deadline=deadline,
+                                           prefix=prefixes[0])
+        probe = time.time() - _t0
+        merged: List[nx.Graph] = []
+        seen: Dict[str, List[nx.Graph]] = {}
+        if probe * len(prefixes) < _POOL_STARTUP_SEC * _POOL_MIN_GAIN:
+            for g in first:
+                _seen_add(seen, _wl_hash_from_graph(g), g, merged)
+            for p in prefixes[1:]:
+                for g in self.generate_for_target_h(target_h, deadline=deadline,
+                                                    prefix=p):
+                    _seen_add(seen, _wl_hash_from_graph(g), g, merged)
+            return merged
+
+        for g in first:
+            _seen_add(seen, _wl_hash_from_graph(g), g, merged)
+        args = [(self.n_carbon, self.n_oxygen, target_h, p, self.max_atoms,
+                 deadline) for p in prefixes[1:]]
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                for sub in ex.map(_oracle_prefix_worker_o, args, chunksize=1):
+                    for g in sub:
+                        _seen_add(seen, _wl_hash_from_graph(g), g, merged)
+        except Exception as exc:
+            print(f"  [O 系预言机] 进程池不可用（{type(exc).__name__}: "
+                  f"{str(exc)[:80]}），已退回串行枚举（结果不变，仅慢）")
+            return self.generate_for_target_h(target_h, deadline=deadline)
+        return merged
 
     # ── 核心回溯 ──
 

@@ -19,9 +19,33 @@
   对外部工具**零依赖**（合规红线 §8.4-3）。MAYGEN 对照已剥离为可选脚本
   `maygen_compare.py`。
 
-**未实现（后续阶段）**：N+O 组合（硝基 -NO₂、酰胺 -CONH₂、硝基苯等，需 2 价 O 参与）、
-含 N 杂环约束路径（必含吡啶等）、funcgroup 分类、GUI 集成、大公式性能优化。
-按 `O_project_guide.md` §9 蓝图，NO₂ = 2O + 1N 组合约束属于 N/P 扩展的后续 Step。
+**已实现**：
+- **GUI 接入（第一期，2026-09-21）**：生成 / 列表 / 分子式文本
+  （Main.py `_generate_in_background` 的含氮分支走 `AtomicMatrixNGenerator`）；
+- **渲染与导出（第二期，2026-09-21）**：**键线式 2D / 3D 可视化 / Gaussian `.gjf` 导出**
+  ——含氮结构与烃 / 含氧 / 卤代**共用同一渲染与导出链路**，元素由 `element_of` 回调
+  按节点 `label` 判定。实施记录见 `Instruction Data/开发过程.md` §十四。
+- **路线 A：N+O 组合（第三期，2026-09-21）**：预言机扩到 **C/N/O**（价态 4/3/2），
+  支持 `C2H5NO`、`CH4N2O`（尿素）、`C2H5NO2`、`C5H5NO` 等含氮含氧分子式；
+  15 个 N+O 公式经 MAYGEN 一次性对拍 **0 缺 0 多**（§十五）。
+  同轮完成**预言机并行化**（前缀切分 + 进程池 + 父进程去重，C6H5N 1.9~2.8×、大公式更高）。
+
+**未实现（后续阶段）**：
+- **硝基 –NO₂**：中性八隅律 **N=3** 下不在枚举空间内（需电荷分离式 N⁺–O⁻）。
+  ⚠ 与 **MAYGEN 默认价态一致**（CH3NO2 两侧同为 15 个结构，均不含硝基），非"缺失"；
+  已提供**按需挂载**通道 `special_groups.py`（`attach_group(G, node, 'nitro')`，
+  可渲染 / 导出，**不进枚举**）；
+- 含 N 杂环约束路径（必含吡啶等）、funcgroup 含氮分类；
+- **O 系预言机并行化**（本次先落在 N 系主生成器，O 系可照搬同一套前缀机制）。
+
+> ✅ **互斥已全部解除（2026-09-21）**：含氮可自由组合 **O 与卤素**——
+> `C2H5NO`、`CH4ClN`、`C2H4ClNO` 均可用；N+卤素经 MAYGEN 对拍 **0 缺 0 多**
+> （见 `开发过程.md` §16.3）。
+
+> ⚠ **含氧 / 卤代的 `.gjf` 导出仍是待办**（`开发过程.md` §10.7 待办 2）：
+> `_build_rdkit_mol` 在"骨架 + 取代基"模型下不建 `oxo_counts`（OH/=O）与
+> `halogen_counts` 原子；本次只在**节点模型**（N / N+O 预言机产出）下新增了
+> 按元素建 O 的能力，刻意不改含氧路径以免行为漂移。
 
 ---
 
@@ -215,8 +239,16 @@ A 的产出 ⊆ 合法 C/H/N 图。故 A ⊇ 全集且 A ⊆ 全集。
 3. **大公式性能**：预言机对 ≥8 重原子变慢（C6H5N ≈ 64~73s）。
    ⚠ 注意：**改用树机制并不能加速**（见 §6），真正的优化方向是：
    ① 预言机的进程池并行（参照 O 系 `use_parallel`）；② 对高不饱和度档位增加剪枝。
-4. **GUI 集成**：暂不动 Main.py；后续接入 GeneratorManager 需同步 `parse_compound_formula`、
-   `MOL_NAMES_CN`、类型分发、funcgroup 面板。
+4. **GUI 集成（已完成，第一期）**：Main.py 已接入。接入点：
+   `utils.parse_compound_formula` 扩展为 **8 元组**（末位 `n_nitrogen`）、
+   新增 `utils.graph_formula_parts_full`（支持 `label='N'`，C=4/N=3/O=2）、
+   `MOL_NAMES_CN/FILTER/EN` 增加 `'nitrogen'`、`structure_filter.filter_by_expected_formula`
+   增加 `n_nitrogen` 关键字、`Main.py` 新增含氮生成分支与展示分支。
+   **第二期（2026-09-21）已补齐**键线式 / 3D / `.gjf` 导出，接入点：
+   `utils.graph_to_rdkit_mol` 元素价态表支持 `label='N'`（C=4 / N=3 / O=2）、
+   `Main._build_rdkit_mol` 把 N 建为 **3 价氮原子**、`_extract_coords` 改为收集
+   **全部重原子**、`_parallel_compute_coords` 增加 `'nitrogen'` 分支、
+   `gaussian_export.build_gjf` 坐标段按元素渲染（原实现硬编码 `'C'`）。
 5. **高价态 N（预留）**：MAYGEN 支持 `N(5)` 显式覆盖；本项目默认 N=3，如需铵盐/配位
    形态，在价态表参数化处扩展（`formula.VALENCE` / 预言机 `valences`）。
 

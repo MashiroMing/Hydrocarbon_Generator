@@ -23,6 +23,13 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 控制台编码兜底：断言名含 'Å' 等非 GBK 字符，Windows GBK 控制台/重定向会抛
+# UnicodeEncodeError（在 UTF-8 控制台无影响）。
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 import numpy as np
 
 from gaussian_export import (GjfSettings, build_gjf, compose_route_line,
@@ -370,6 +377,174 @@ def test_settings():
 
 
 # --------------------------------------------------------------------------
+# 5.5 含氮导出（第二期）：元素渲染 / 氢数按元素 / 守卫 / 纯烃逐字节回归
+# --------------------------------------------------------------------------
+
+def _ethylamine():
+    """乙胺 CH3-CH2-NH2：节点 0,1 为 C、节点 2 为 N（含氮第一阶段图口径）"""
+    import networkx as nx
+    G = nx.Graph()
+    for i, lab in enumerate(('C', 'C', 'N')):
+        G.add_node(i, label=lab)
+    G.add_edge(0, 1, bond_type='single')
+    G.add_edge(1, 2, bond_type='single')
+    return G
+
+
+def test_nitrogen_export():
+    print("\n== 5.5 含氮导出（元素渲染 / 氢数 / 守卫） ==")
+
+    G = _ethylamine()
+    elem = lambda n, _G=G: _G.nodes[n].get('label', 'C')      # noqa: E731
+
+    # 氢数按元素：N 为 3 价 → 乙胺中 N 应得 2 个 H（旧实现按 2 价会给 1 个）
+    counts = hydrogen_counts(G, elem)
+    check("氢数按元素：N 得 2 个 H（3 价）", counts.get(2) == 2, f"counts={counts}")
+    check("氢数按元素：C0 得 3 个 H", counts.get(0) == 3, f"counts={counts}")
+    check("氢数按元素：总 H = 7", sum(counts.values()) == 7, f"counts={counts}")
+
+    heavy = {0: (0.0, 0.0, 0.0), 1: (1.47, 0.0, 0.0), 2: (2.10, 1.02, 0.0)}
+    hs = place_hydrogens(heavy, counts)
+    res = build_gjf("C2H7N Nitrogen Isomer #1", heavy, hs, G, element_of=elem)
+    blocks = _parse_blocks(res.text)
+    atom_elems = [l.split()[0] for l in blocks["atoms"]]
+
+    check("含氮：坐标段元素序列为 C,C,N(,H...)", atom_elems[:3] == ['C', 'C', 'N'],
+          f"atoms={atom_elems[:6]}")
+    check("含氮：校验零问题", validate_gjf(res.text) == [], str(validate_gjf(res.text)))
+    check("含氮：输出连通性块", res.connectivity, str(res.warnings))
+    check("含氮：route 声明 Geom=Connectivity",
+          "Geom=Connectivity" in res.route_line, res.route_line)
+    # 连通性块：N（第 3 个重原子）应出现且带键级
+    check("含氮：连通性块含第 3 个重原子（N）",
+          any(l.strip().startswith("3 ") for l in blocks["conn"]), str(blocks["conn"]))
+
+    # 甲胺 CH5N（无 C–C 键，N 与唯一 C 相连）
+    import networkx as nx
+    G2 = nx.Graph()
+    G2.add_node(0, label='C')
+    G2.add_node(1, label='N')
+    G2.add_edge(0, 1, bond_type='single')
+    elem2 = lambda n, _G=G2: _G.nodes[n].get('label', 'C')     # noqa: E731
+    counts2 = hydrogen_counts(G2, elem2)
+    heavy2 = {0: (0.0, 0.0, 0.0), 1: (1.47, 0.0, 0.0)}
+    res2 = build_gjf("CH5N Nitrogen Isomer #1", heavy2,
+                     place_hydrogens(heavy2, counts2), G2, element_of=elem2)
+    a2 = [l.split()[0] for l in _parse_blocks(res2.text)["atoms"]]
+    check("甲胺：坐标段元素序列为 C,N(,H...)", a2[:2] == ['C', 'N'], f"atoms={a2[:5]}")
+    check("甲胺：校验零问题且连通性可用",
+          validate_gjf(res2.text) == [] and res2.connectivity,
+          f"{res2.warnings}")
+
+    # 守卫：故意少放一个 H（N 上缺氢）→ 必须**降级**而非写出错误连通性
+    res3 = build_gjf("C2H7N Nitrogen Isomer #1", heavy, hs[:-1], G, element_of=elem)
+    check("含氮：氢数与图不符时自动降级（不写连通性块）",
+          res3.connectivity is False and bool(res3.warnings),
+          f"conn={res3.connectivity} warn={res3.warnings}")
+
+    # 纯烃逐字节回归：不传 element_of 时坐标段仍全为 C
+    Ge = nx.Graph()
+    Ge.add_edge(0, 1, bond_type='double')
+    heavy_e = {0: (0.0, 0.0, 0.0), 1: (1.34, 0.0, 0.0)}
+    res_e = build_gjf("C2H4 alkene Isomer #1", heavy_e,
+                      place_hydrogens(heavy_e, hydrogen_counts(Ge)), Ge)
+    e_elems = [l.split()[0] for l in _parse_blocks(res_e.text)["atoms"]]
+    check("回归：纯烃坐标段只有 C/H（无 N，旧行为不变）",
+          set(e_elems) <= {'C', 'H'} and 'N' not in e_elems, f"atoms={e_elems}")
+
+
+# --------------------------------------------------------------------------
+# 5.6 含氧 / 卤代导出（取代基展开回归锁）
+# --------------------------------------------------------------------------
+
+def _benzene_ring():
+    """苯环（凯库勒式）+ 可选取代基：返回 (G, skeleton_nodes)"""
+    import networkx as nx
+    G = nx.Graph()
+    for i in range(6):
+        G.add_node(i, label='C')
+    for i in range(6):
+        bt = 'double' if i % 2 == 0 else 'single'
+        G.add_edge(i, (i + 1) % 6, bond_type=bt)
+    return G
+
+
+def test_oxygen_halogen_export():
+    """含氧 / 卤代 .gjf 导出：取代原子必须显式成节点，否则静默丢原子
+
+    历史缺陷（开发过程.md §16.1）：`_build_rdkit_mol` 的骨架+取代基模型
+    不建 oxo_counts / halogen_counts 原子 → 导出 C6H6O 实为 C6H8（O 丢失、
+    H 多 2），且守卫同源失效、`validate_gjf` 报 0 问题（静默错误输入卡）。
+    """
+    print("\n== 5.6 含氧 / 卤代导出（取代基展开） ==")
+    from utils import expand_substituent_graph, format_graph_formula
+
+    # 苯酚：苯环 + 一个 OH
+    G = _benzene_ring()
+    G.nodes[0]['oxo_counts'] = (1, 0)
+    check("苯酚：骨架图公式 = C6H6O", format_graph_formula(G) == 'C6H6O',
+          format_graph_formula(G))
+    Ge = expand_substituent_graph(G)
+    check("苯酚：展开后仍是 C6H6O（展开不变量）",
+          format_graph_formula(Ge) == 'C6H6O', format_graph_formula(Ge))
+    check("苯酚：展开后显式节点数 = 7", Ge.number_of_nodes() == 7,
+          str(Ge.number_of_nodes()))
+    check("苯酚：展开后新增节点 label='O'",
+          Ge.nodes[6].get('label') == 'O', str(Ge.nodes[6]))
+    check("苯酚：展开后 C–O 为单键",
+          Ge[0][6].get('bond_type') == 'single', str(Ge[0][6]))
+
+    elem = lambda n, _G=Ge: _G.nodes[n].get('label', 'C')        # noqa: E731
+    counts = hydrogen_counts(Ge, elem)
+    check("苯酚：总 H = 6（苯环 5 + OH 1）", sum(counts.values()) == 6,
+          str(counts))
+    heavy = {0: (0.0, 0.0, 0.0), 1: (1.39, 0.0, 0.0), 2: (2.09, 1.20, 0.0),
+             3: (1.39, 2.41, 0.0), 4: (0.0, 2.41, 0.0), 5: (-0.70, 1.20, 0.0),
+             6: (-1.36, -0.70, 0.0)}
+    res = build_gjf("C6H6O phenol Isomer #1", heavy,
+                    place_hydrogens(heavy, counts), Ge, element_of=elem)
+    elems = [l.split()[0] for l in _parse_blocks(res.text)["atoms"]]
+    check("苯酚：坐标段含 O 且只有 1 个 O",
+          elems.count('O') == 1, str(elems))
+    check("苯酚：坐标段 C 数 = 6", elems.count('C') == 6, str(elems))
+    check("苯酚：H 数 = 6", elems.count('H') == 6, str(elems))
+    check("苯酚：连通性块可用（守卫未误降级）", res.connectivity, str(res.warnings))
+    check("苯酚：校验零问题", validate_gjf(res.text) == [],
+          str(validate_gjf(res.text)))
+
+    # 氯苯：苯环 + 一个 Cl
+    G2 = _benzene_ring()
+    G2.nodes[0]['halogen_counts'] = (0, 1, 0, 0)
+    check("氯苯：骨架图公式 = C6H5Cl", format_graph_formula(G2) == 'C6H5Cl',
+          format_graph_formula(G2))
+    Ge2 = expand_substituent_graph(G2)
+    check("氯苯：展开后仍 C6H5Cl 且含 Cl 节点",
+          format_graph_formula(Ge2) == 'C6H5Cl'
+          and Ge2.nodes[6].get('label') == 'Cl',
+          f"{format_graph_formula(Ge2)} {Ge2.nodes[6]}")
+    elem2 = lambda n, _G=Ge2: _G.nodes[n].get('label', 'C')      # noqa: E731
+    counts2 = hydrogen_counts(Ge2, elem2)
+    check("氯苯：总 H = 5", sum(counts2.values()) == 5, str(counts2))
+    heavy2 = dict(heavy)
+    heavy2[6] = (-1.70, -0.30, 0.0)          # C–Cl ≈ 1.74 Å
+    res2 = build_gjf("C6H5Cl chlorobenzene Isomer #1", heavy2,
+                     place_hydrogens(heavy2, counts2), Ge2, element_of=elem2)
+    e2 = [l.split()[0] for l in _parse_blocks(res2.text)["atoms"]]
+    check("氯苯：坐标段含 Cl 且只有 1 个", e2.count('Cl') == 1, str(e2))
+    check("氯苯：连通性块可用", res2.connectivity, str(res2.warnings))
+    check("氯苯：校验零问题", validate_gjf(res2.text) == [],
+          str(validate_gjf(res2.text)))
+
+    # 节点模型（N / N+O 预言机图）→ 展开必须是恒等（零风险）
+    Gn = __import__("networkx").Graph()
+    Gn.add_node(0, label='C')
+    Gn.add_node(1, label='N')
+    Gn.add_edge(0, 1, bond_type='single')
+    check("节点模型：expand 为恒等（返回原图对象）",
+          expand_substituent_graph(Gn) is Gn)
+
+
+# --------------------------------------------------------------------------
 # 6. 端到端（真实生成器 + RDKit 坐标）
 # --------------------------------------------------------------------------
 
@@ -432,7 +607,31 @@ def test_end_to_end():
         if not res.connectivity:
             print(f"    降级原因: {res.warnings}")
 
-    # 6.3 逐一核对：真实坐标下最近重原子距离是否在阈值内
+    # 6.3 含氮端到端：真实预言机图 + RDKit 坐标 + 元素渲染（第二期）
+    try:
+        from Nitrogen.validate import oracle_count
+        from Main import (_build_rdkit_mol, _embed_single_conformer,
+                          _extract_coords)
+
+        graphs = oracle_count(2, 1, 7)          # C2H7N：乙胺 / 二甲胺
+        n_ok = 0
+        for G in graphs:
+            mol = _build_rdkit_mol(G)
+            if mol is None or not _embed_single_conformer(mol):
+                continue
+            coords, h_coords = _extract_coords(mol)
+            elem = lambda n, _G=G: _G.nodes[n].get('label', 'C')   # noqa: E731
+            res = build_gjf("C2H7N Nitrogen Isomer #1", coords, h_coords,
+                            G, element_of=elem)
+            elems = [l.split()[0] for l in _parse_blocks(res.text)["atoms"]]
+            if not validate_gjf(res.text) and res.connectivity and 'N' in elems:
+                n_ok += 1
+        check(f"C2H7N 含氮端到端：{len(graphs)} 个异构体全部合法且坐标段含 N",
+              n_ok == len(graphs), f"通过 {n_ok}/{len(graphs)}")
+    except Exception as _e:
+        check("C2H7N 含氮端到端", False, f"{type(_e).__name__}: {_e}")
+
+    # 6.4 逐一核对：真实坐标下最近重原子距离是否在阈值内
     G = nx.Graph()
     G.add_edge(0, 1, bond_type='single')
     c_coords, h_coords = _rdkit_coords_single(G)
@@ -454,6 +653,8 @@ def main():
     test_connectivity()
     test_guard_degradation()
     test_settings()
+    test_nitrogen_export()
+    test_oxygen_halogen_export()
     if RUN_E2E:
         test_end_to_end()
     print("\n" + "=" * 70)

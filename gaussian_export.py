@@ -301,6 +301,9 @@ def _fmt_order(order: float) -> str:
 def hydrogen_counts(G: Any, element_of: Optional[Callable[[Any], str]] = None) -> Dict[Any, int]:
     """按价态推算每个**重原子**应带的氢数：``价态 − 成键负载``。
 
+    价态口径：``ELEMENT_VALENCE`` 基准价 + 该节点的 ``formal_charge``
+    （**带符号**：阳离子多成键、阴离子少成键；特殊基团如硝基电荷分离式
+    ``N⁺`` 允许 4 键、``O⁻`` 只允许 1 键，均由此规则给出）。
     氢节点本身返回 0（显式氢图不重复计数）。
     """
     counts: Dict[Any, int] = {}
@@ -310,6 +313,11 @@ def hydrogen_counts(G: Any, element_of: Optional[Callable[[Any], str]] = None) -
             counts[node] = 0
             continue
         valence = ELEMENT_VALENCE.get(elem, 4)
+        try:
+            q = int(G.nodes[node].get("formal_charge", 0) or 0)
+        except Exception:
+            q = 0
+        valence = max(0, valence + q)
         load = 0.0
         for nb in G.neighbors(node):
             load += _bond_order(G[node][nb])
@@ -486,10 +494,30 @@ def build_gjf(
     lines.append("")                       # route 段终止
     lines.append(clean_title)              # title 段
     lines.append("")                       # title 段终止
-    lines.append(f"{cfg.charge} {cfg.multiplicity}")
+    # -- 电荷：仅当**图中确有形式电荷信息**（特殊基团如硝基 N⁺/O⁻）时才以图为准；
+    #    否则尊重用户的配置（历史行为不变：自由基等按配置电荷导出） ----------
+    total_q = 0
+    has_charge_info = False
+    if G is not None:
+        try:
+            for _n, _d in G.nodes(data=True):
+                if 'formal_charge' in _d:
+                    has_charge_info = True
+                    total_q += int(_d.get('formal_charge', 0) or 0)
+        except Exception:
+            has_charge_info = False
+            total_q = 0
+    if has_charge_info and total_q != cfg.charge:
+        warnings.append(f"图中形式电荷合计 {total_q:+d}，已覆盖配置电荷 {cfg.charge:+d}")
+    charge = total_q if has_charge_info else cfg.charge
+    lines.append(f"{charge} {cfg.multiplicity}")
 
-    for (x, y, z) in heavy_pts:
-        lines.append(f"{'C':<2s}{x:>14.6f}{y:>14.6f}{z:>14.6f}")
+    # 坐标段：每个重原子按其**元素符号**输出（此前硬编码 'C'，含杂原子
+    # 导出会把 N/O 写成碳；元素由 element_of 回调 / 图节点属性判定，
+    # 碳骨架情形与旧输出逐字节一致）。
+    for _k, (x, y, z) in zip(heavy_keys, heavy_pts):
+        _elem = _element_of(_k, G, element_of)
+        lines.append(f"{_elem:<2s}{x:>14.6f}{y:>14.6f}{z:>14.6f}")
     for h in h_coords:
         hx, hy, hz = _as_xyz(h)
         lines.append(f"{'H':<2s}{hx:>14.6f}{hy:>14.6f}{hz:>14.6f}")

@@ -48,12 +48,13 @@ from typing import Dict, List, Optional, Tuple
 # 推荐用法仍是 `python -m Nitrogen.validate`；直跑时把项目根加入 sys.path 并转绝对导入。
 if __package__ in (None, ''):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from Nitrogen.formula import (parse_formula, graph_formula_parts,
+    from Nitrogen.formula import (parse_formula, parse_formula_full,
+                                  graph_formula_parts,
                                   format_graph_formula, dbe_from_parts)
     from Nitrogen.atomic_matrix_n import AtomicMatrixNGenerator
     from Nitrogen.generator import NitrogenGenerator
 else:
-    from .formula import (parse_formula, graph_formula_parts,
+    from .formula import (parse_formula, parse_formula_full, graph_formula_parts,
                           format_graph_formula, dbe_from_parts)
     from .atomic_matrix_n import AtomicMatrixNGenerator
     from .generator import NitrogenGenerator
@@ -91,25 +92,26 @@ CHEM_FACTS: Dict[str, Tuple[int, str]] = {
 # ══════════════════════════════════════════════════════════════════
 
 @lru_cache(maxsize=64)
-def _oracle_cached(n_c: int, n_n: int, target_h: int) -> tuple:
+def _oracle_cached(n_c: int, n_n: int, target_h: int, n_o: int = 0) -> tuple:
     """内部预言机枚举（无超时路径的缓存层）"""
-    gen = AtomicMatrixNGenerator(n_c, n_n)
+    gen = AtomicMatrixNGenerator(n_c, n_n, n_o)
     if not gen._can_enumerate():
         return ()
     return tuple(gen.generate_for_target_h(target_h))
 
 
 def oracle_count(n_c: int, n_n: int, target_h: int,
-                 deadline: Optional[float] = None) -> List:
+                 deadline: Optional[float] = None, n_o: int = 0) -> List:
     """预言机生成指定分子式的全部结构
 
     Args:
         deadline: 可选超时（time.time() 绝对时刻）。超时则返回 [] 并由
                   调用方走降级路径。带 deadline 的调用不走缓存。
+        n_o: 氧原子数（**末位默认 0** → 既有调用逐位不变；路线 A 起支持 C/N/O）。
     """
-    if deadline is None:
+    if n_o == 0 and deadline is None:
         return list(_oracle_cached(n_c, n_n, target_h))
-    gen = AtomicMatrixNGenerator(n_c, n_n)
+    gen = AtomicMatrixNGenerator(n_c, n_n, n_o)
     if not gen._can_enumerate():
         return []
     try:
@@ -196,6 +198,99 @@ def check_internal_baseline(formulas: Optional[List[str]] = None) -> int:
               f"{(str(base) if base is not None else '-'):>8} "
               f"{mark:>4} {dbe:>4.0f}  {dt:6.1f}s")
     print("-" * 62)
+    return n_fail
+
+
+# ── 内部基线（回归锁）：路线 A —— 含氮含氧 C/H/N/O ─────────────────
+# 来源：内部预言机 atomic_matrix_n.py（C=4/N=3/O=2）实测 2026-09-21；
+#       每个值另经 **一次性 MAYGEN 外部对拍** 验证（计数与 SMILES 集合 0 缺 0 多，
+#       见开发过程.md §十五）——外部对拍只用于**首次确认**，回归只读本表。
+# 口径提醒：中性八隅律 N=3 ⇒ **硝基 -NO₂ 不在空间内**（MAYGEN 默认价态同样不含）。
+INTERNAL_BASELINE_NO: Dict[str, int] = {
+    # ≤5 重原子（默认电池，秒级）
+    'CH3NO': 5, 'CH5NO': 3, 'CH3NO2': 15, 'CH4N2O': 21, 'C2H5NO': 22,
+    'C2H3NO': 26, 'C2H5NO2': 84, 'C2H4N2O': 177, 'C3H7NO': 84, 'C3H5NO': 154,
+    'C3H3NO': 136, 'C2H2N2O': 114,
+    # ≥6 重原子（较慢，仅在 --full 档跑）
+    'C4H9NO': 299, 'C4H7NO': 764, 'C5H5NO': 7687,
+}
+
+# 默认电池：只跑 ≤5 重原子的那些（快）
+_N_O_FAST = ['CH3NO', 'CH5NO', 'CH3NO2', 'CH4N2O', 'C2H5NO', 'C2H3NO',
+             'C2H5NO2', 'C2H4N2O', 'C3H7NO', 'C3H5NO', 'C3H3NO', 'C2H2N2O']
+
+
+def check_n_plus_o_baseline(formulas: Optional[List[str]] = None) -> int:
+    """路线 A 基线电池：预言机计数（C/H/N/O）vs INTERNAL_BASELINE_NO + 公式门禁
+
+    Returns:
+        失败数（解析失败 / 计数漂移 / 公式不符）
+    """
+    from .formula import parse_formula_full, formula_matches_input
+    if formulas is None:
+        formulas = _N_O_FAST
+    n_fail = 0
+    print(f"{'分子式':<10} {'预言机':>7} {'基线':>7} {'一致':>4}  {'DBE':>4}  耗时")
+    print("-" * 62)
+    for fml in formulas:
+        n_c, n_h, n_n, n_o, err = parse_formula_full(fml)
+        if err:
+            print(f"{fml:<10} 解析失败: {err}")
+            n_fail += 1
+            continue
+        t0 = time.time()
+        graphs = oracle_count(n_c, n_n, n_h, n_o=n_o)
+        dt = time.time() - t0
+        n_oracle = len(graphs)
+        base = INTERNAL_BASELINE_NO.get(fml)
+        bad_gate = sum(1 for g in graphs
+                       if not formula_matches_input(g, n_c, n_h, n_n, n_o))
+        ok = ((base is None or n_oracle == base) and bad_gate == 0)
+        if not ok:
+            n_fail += 1
+        mark = "OK " if ok else "FAIL"
+        dbe = dbe_from_parts(n_c, n_h, n_n)
+        print(f"{fml:<10} {n_oracle:>7} "
+              f"{(str(base) if base is not None else '-'):>7} "
+              f"{mark:>4} {dbe:>4.0f}  {dt:6.1f}s"
+              + (f"  [门禁不符 {bad_gate}]" if bad_gate else ""))
+    print("-" * 62)
+    return n_fail
+
+
+def check_parallel_equiv(formulas: Optional[List[str]] = None) -> int:
+    """并行预言机等价性回归：``generate_for_target_h_parallel`` == 串行结果
+
+    锁定不变量：前缀切分 + 父进程 WL/VF2 跨子树去重后，唯一图集合与串行
+    **逐元素一致**（只差顺序）。选小公式保证秒级完成。
+    """
+    import networkx as nx
+    if formulas is None:
+        formulas = ['C3H7N', 'C4H9N', 'C2H5NO', 'CH4N2O', 'C5H7N']
+    n_fail = 0
+    print(f"{'分子式':<9} {'串行':>6} {'并行':>6} {'一致':>4}  加速")
+    print("-" * 46)
+    for fml in formulas:
+        n_c, n_h, n_n, n_o, err = parse_formula_full(fml)
+        if err:
+            print(f"{fml:<9} 解析失败: {err}")
+            n_fail += 1
+            continue
+        gen = AtomicMatrixNGenerator(n_c, n_n, n_o)
+        t0 = time.time()
+        ser = gen.generate_for_target_h(n_h)
+        t_ser = time.time() - t0
+        t0 = time.time()
+        par = gen.generate_for_target_h_parallel(n_h)
+        t_par = time.time() - t0
+        key = lambda g: nx.weisfeiler_lehman_graph_hash(       # noqa: E731
+            g, node_attr='label', edge_attr='bond_type')
+        ok = (len(ser) == len(par) and {key(g) for g in ser} == {key(g) for g in par})
+        if not ok:
+            n_fail += 1
+        print(f"{fml:<9} {len(ser):>6} {len(par):>6} {'OK ' if ok else 'FAIL':>4}  "
+              f"{(t_ser / t_par) if t_par else 0:4.2f}x")
+    print("-" * 46)
     return n_fail
 
 
@@ -457,12 +552,12 @@ def sample_structures(formula: str, limit: int = 12,
         graphs: 已枚举的图列表；None 时内部调用预言机（小分子式）。
         source: 来源标注，如 '预言机' / '树机制(部分，非完备)'。
     """
-    n_c, n_h, n_n, err = parse_formula(formula)
+    n_c, n_h, n_n, n_o, err = parse_formula_full(formula)
     if err:
         print(err)
         return
     if graphs is None:
-        graphs = oracle_count(n_c, n_n, n_h)
+        graphs = oracle_count(n_c, n_n, n_h, n_o=n_o)
     print(f"\n{formula}: 共 {len(graphs)} 个结构（{source}）。样例：")
     for i, g in enumerate(graphs[:limit]):
         edges = []
@@ -484,9 +579,9 @@ _USAGE = """\
   python -m Nitrogen.validate --anchors              # 只跑锚点电池 + 完备性
 
 选项：
-  分子式...      待计算的 C/H/N 分子式，如 C2H7N C5H5N（可多个）
+  分子式...      待计算的分子式（**C/H/N/O**），如 C2H7N C5H5N C2H5NO CH4N2O
   -i, --interactive   进入交互模式（逐条输入分子式）
-  --anchors           运行锚点电池（内部基线 + 化学事实 + 覆盖率）
+  --anchors           运行锚点电池（内部基线 N + N+O 基线 + 化学事实 + 覆盖率）
   -v, --verbose       打印覆盖率缺失结构明细
   --tree              强制树机制（部分路径，非完备；**不比预言机快**）
   --oracle            强制预言机完备枚举（重原子>7 带 30s 超时兜底）
@@ -523,14 +618,14 @@ def _run_single_formula(fml: str, verbose: bool = False,
     Returns:
         失败项计数（解析失败 / 预言机超时 / 覆盖率缺失）
     """
-    n_c, n_h, n_n, err = parse_formula(fml)
+    n_c, n_h, n_n, n_o, err = parse_formula_full(fml)
     if err:
         print(f"{fml}: 解析失败 -> {err}")
         return 1
-    n_atoms = n_c + n_n
+    n_atoms = n_c + n_n + n_o
     n_fail = 0
 
-    if mode == 'tree' or (mode == 'auto' and n_atoms > _ORACLE_ATOM_LIMIT):
+    if n_o == 0 and (mode == 'tree' or (mode == 'auto' and n_atoms > _ORACLE_ATOM_LIMIT)):
         # ── 树机制预览路径（部分集合，非完备） ──
         t0 = time.time()
         tree = tree_generate(n_c, n_n, n_h)
@@ -549,17 +644,21 @@ def _run_single_formula(fml: str, verbose: bool = False,
 
     # ── 预言机完备路径（N ≤ _ORACLE_ATOM_LIMIT，或 --oracle 强制） ──
     deadline = time.time() + _ORACLE_DEADLINE if n_atoms > _ORACLE_ATOM_LIMIT else None
-    graphs = oracle_count(n_c, n_n, n_h, deadline=deadline)
+    graphs = oracle_count(n_c, n_n, n_h, deadline=deadline, n_o=n_o)
     if not graphs and n_atoms > _ORACLE_ATOM_LIMIT:
         print(f"  （{fml} 重原子 {n_atoms} 预言机枚举超过 {_ORACLE_DEADLINE:.0f}s，"
               f"已中断；建议放宽超时或改用 --tree 预览）")
         return 1
     sample_structures(fml, graphs=graphs, source='预言机')
-    n_fail += check_anchors([fml])
-    if n_atoms <= _ORACLE_ATOM_LIMIT:
-        n_fail += check_coverage([fml], verbose)
+    if n_o > 0:
+        # 含氧含氮（路线 A）：走 N+O 基线电池（树机制不覆盖 O，故跳过覆盖率）
+        n_fail += check_n_plus_o_baseline([fml])
     else:
-        print(f"  （{fml} 重原子 {n_atoms} > {_ORACLE_ATOM_LIMIT}，跳过覆盖率枚举）")
+        n_fail += check_anchors([fml])
+        if n_atoms <= _ORACLE_ATOM_LIMIT:
+            n_fail += check_coverage([fml], verbose)
+        else:
+            print(f"  （{fml} 重原子 {n_atoms} > {_ORACLE_ATOM_LIMIT}，跳过覆盖率枚举）")
     return n_fail
 
 
@@ -647,6 +746,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if anchors_only:
         print()
         n_fail += check_anchors()
+        print()
+        n_fail += check_n_plus_o_baseline()
+        print()
+        n_fail += check_parallel_equiv()
         print()
         n_fail += check_oracle_selfconsistent()
         print()

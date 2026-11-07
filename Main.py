@@ -44,7 +44,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from utils import (
     GeneratorManager,
     compute_formula,
+    expand_substituent_graph,
     format_formula,
+    format_graph_formula,
     MOL_NAMES_CN,
     MOL_NAMES_FILTER,
     MOL_NAMES_EN,
@@ -77,6 +79,10 @@ try:
 except ImportError:
     HAS_SKELETAL_DRAWING = False
 
+# 含氮（第一阶段纯 C/H/N）完备枚举的重原子数上限
+# （与 Nitrogen 预言机默认 max_atoms=10 保持一致；超过则枚举量急剧增长）
+_N_MAX_ATOMS = 10
+
 
 def _parallel_compute_coords(args):
     """多进程并行计算分子3D坐标（顶层函数，可被pickle）"""
@@ -97,6 +103,12 @@ def _parallel_compute_coords(args):
             return idx, {}, []
 
         # 根据分子类型计算坐标
+        # ⚠ 含氧 / 卤代：先把「骨架 + 取代基计数」图展开为**显式原子图**，
+        #   否则取代原子（OH/=O/卤素）根本不进入分子对象 → 坐标缺失、
+        #   `.gjf` 静默错误（历史缺陷，见开发过程.md §16.1）。
+        from utils import expand_substituent_graph
+        G = expand_substituent_graph(G)
+
         if mol_type == 'alkane':
             return idx, *_rdkit_coords_single(G)
 
@@ -109,6 +121,12 @@ def _parallel_compute_coords(args):
 
         elif mol_type == 'cycloalkane':
             return idx, *_rdkit_coords_single(G)
+
+        elif mol_type == 'nitrogen':
+            # 含氮（第二期接入）：纯 C/H/N，可含双键/三键/环。
+            # _build_rdkit_mol 已把 label='N' 建为 3 价氮原子，
+            # _rdkit_coords_with_bonds 处理多重键 + 含环多种子策略。
+            return idx, *_rdkit_coords_with_bonds(G, double_only=False)
 
         else:
             return idx, {}, []
@@ -146,10 +164,14 @@ def _relax_bond_lengths(G, c_coords, h_coords, n_carbons,
     h_list = [list(h) for h in h_coords]
 
     for iteration in range(max_iters):
-        # 查找异常边
+        # 查找异常边（**只处理 C–C 键**：C–O/C–N/C–卤 的目标键长不同，
+        # 例如 C–Cl ≈ 1.79 Å，按 1.54 Å 目标"松弛"会把卤素拉错位）
         bad_edges = []
         for u, v in G.edges():
             if u >= n_carbons or v >= n_carbons:
+                continue
+            if (G.nodes[u].get('label', 'C') != 'C'
+                    or G.nodes[v].get('label', 'C') != 'C'):
                 continue
             d = np.linalg.norm(c_arr[u] - c_arr[v])
             if d > target + tol or d < target - tol:
@@ -371,18 +393,25 @@ def _fallback_coords_from_graph(G):
 
 
 def _extract_coords(mol):
-    """从RDKit分子对象提取碳/氢坐标"""
+    """从RDKit分子对象提取**重原子**坐标与氢坐标。
+
+    返回 ``(heavy_coords, h_coords)``：
+      · ``heavy_coords``：``{原子索引: (x, y, z)}``，索引与图节点编号一致；
+      · ``h_coords``：``[(x, y, z), ...]``。
+    「重原子」= 非氢（第二期含氮接入后 mol 中可能是 C 与 N；此前的
+    ``== 'C'`` 写法在 mol 只含 C+H 时行为完全一致，故既有路径不受影响）。
+    """
     conf = mol.GetConformer()
-    c_coords = {}
+    heavy_coords = {}
     h_coords = []
     for atom in mol.GetAtoms():
         pos = conf.GetAtomPosition(atom.GetIdx())
         coord = (float(pos.x), float(pos.y), float(pos.z))
-        if atom.GetSymbol() == 'C':
-            c_coords[atom.GetIdx()] = coord
-        else:
+        if atom.GetSymbol() == 'H':
             h_coords.append(coord)
-    return c_coords, h_coords
+        else:
+            heavy_coords[atom.GetIdx()] = coord
+    return heavy_coords, h_coords
 
 
 #: 化学上「所有键必为单键」的分子类型。规范字符串不携带键级信息，
@@ -429,15 +458,37 @@ def _compute_bond_load(G, node):
 def _build_rdkit_mol(G, single_only=False):
     """从 networkx 图构建 RDKit 分子（统一处理键类型与显式氢）。
 
+    两种图模型需区分（关键）：
+      · **节点模型**（N 系预言机 / N+O 路线 A）：所有重原子都是节点，
+        ``label ∈ {'C','N','O'}``，无 ``oxo_counts`` / ``halogen_counts``
+        → 按元素建原子（C=4 / N=3 / **O=2** 价算氢），索引与图节点一致；
+      · **骨架+取代基模型**（含氧 / 卤代路径）：节点是碳骨架（O 桥节点除外），
+        氧/卤素以 ``oxo_counts`` / ``halogen_counts`` 属性存在，本函数**不建**这些
+        取代原子（历史局限，见 `开发过程.md` §10.7 待办 2）→ 沿用旧行为
+        （非 N 节点仍建为碳），以免改变既有含氧 / 卤代 3D 与导出行为。
+
+    节点索引与图节点编号一致（重原子先建、H 由 AddHs 追加在其后），
+    供 ``_extract_coords`` / ``_draw_cc_bonds`` 按索引取坐标。
+
     返回已加氢、已 sanitize 的 RDKit 分子；若 sanitize 失败返回 None。
     """
     from rdkit import Chem
     from rdkit.Chem import BondType
 
-    n_carbons = G.number_of_nodes()
+    # 是否属于"节点模型"（无取代基计数属性）→ 决定是否按元素建杂原子
+    node_model = not any(
+        ('oxo_counts' in d or 'halogen_counts' in d) for _, d in G.nodes(data=True)
+    )
+    _V = {'C': 4, 'N': 3, 'O': 2, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
+
+    n_atoms = G.number_of_nodes()
     mol = Chem.RWMol()
-    for i in range(n_carbons):
-        mol.AddAtom(Chem.Atom('C'))
+    for i in range(n_atoms):
+        label = G.nodes[i].get('label', 'C') if i in G.nodes else 'C'
+        if node_model and label in _V:
+            mol.AddAtom(Chem.Atom(label))          # 节点模型：按元素建原子
+        else:
+            mol.AddAtom(Chem.Atom('N' if label == 'N' else 'C'))
 
     added = set()
     for u, v in G.edges():
@@ -456,9 +507,21 @@ def _build_rdkit_mol(G, single_only=False):
         else:
             mol.AddBond(u, v, BondType.SINGLE)
 
-    # 显式氢（根据价键负载）
+    # 形式电荷（特殊基团，如硝基电荷分离式 N⁺/O⁻）→ RDKit 形式电荷
+    for i in range(n_atoms):
+        q = G.nodes[i].get('formal_charge') if i in G.nodes else None
+        if q:
+            mol.GetAtomWithIdx(i).SetFormalCharge(int(q))
+
+    # 显式氢（按元素价态；节点模型下用完整价态表，其余沿用旧口径）
+    from utils import atom_valence as _atom_valence
     for node in sorted(G.nodes()):
-        h_count = 4 - _compute_bond_load(G, node)
+        label = G.nodes[node].get('label', 'C')
+        if node_model:
+            valence = _atom_valence(label, G.nodes[node])
+        else:
+            valence = 3 if label == 'N' else 4
+        h_count = valence - _compute_bond_load(G, node)
         if h_count > 0:
             mol.GetAtomWithIdx(node).SetNumExplicitHs(h_count)
 
@@ -709,6 +772,7 @@ class MoleculeApp:
 
         # 高级筛选约束
         self.structure_constraint = None  # StructureConstraint | None
+        self._build_mode_info = None      # 基团构建模式诊断（group_builder）
 
         # 创建界面
         self._create_widgets()
@@ -996,6 +1060,12 @@ class MoleculeApp:
                         variable=self._fast_mode_var).pack(side=tk.LEFT,
                                                           padx=(2, 5))
 
+        # ── 基团构建模式（非完备，但极快）──────────────────────────────
+        #   勾选基团后：目标分子式 → 反推母体碳骨架 → 骨架枚举 + 基团挂载
+        #   例：C6H5NO2 + 硝基 → 硝基苯（毫秒级；完整枚举需数小时且拿不到硝基苯）
+        self.group_vars = {}
+        self._build_group_panel(input_frame)
+
         self.cancel_btn = ttk.Button(
             btn_frame,
             text="取消",
@@ -1246,7 +1316,10 @@ class MoleculeApp:
                 if k >= 4:
                     show_benzene = True
 
-        if (mol_types and len(mol_types) > 1) or show_benzene:
+        # 含氮（单一标签，无苯环筛选）：仍需展示「全部 / 含氮化合物」行
+        show_nitrogen = bool(mol_types) and 'nitrogen' in mol_types
+
+        if (mol_types and len(mol_types) > 1) or show_benzene or show_nitrogen:
             # 有同分异构或可选苯环筛选
             self.type_filter_var.set('all')
             
@@ -1287,7 +1360,7 @@ class MoleculeApp:
             formula_str = self.molecule_input.get()
             from utils import parse_compound_formula
             (mol_types, nc, nh, no, halo_spec, nd,
-             error) = parse_compound_formula(formula_str)
+             error, n_nitrogen) = parse_compound_formula(formula_str)
 
             if error:
                 self.parsed_info_var.set(f"⚠ {error}")
@@ -1297,6 +1370,8 @@ class MoleculeApp:
                 mol_names = MOL_NAMES_FILTER
                 type_str = " / ".join([mol_names.get(t, t) for t in mol_types])
                 extra = []
+                if n_nitrogen > 0:
+                    extra.append(f"{n_nitrogen}N")
                 if no > 0:
                     extra.append(f"{no}O")
                 total_halo = sum(halo_spec)
@@ -1322,6 +1397,82 @@ class MoleculeApp:
     # 高级筛选对话框
     # ----------------------------------------------------------------
 
+    def _build_group_panel(self, parent):
+        """基团构建模式面板：勾选基团 → 「碳骨架 + 基团挂载」构建（非完备但极快）"""
+        try:
+            from special_groups import list_groups
+        except Exception:
+            return
+        lf = ttk.LabelFrame(parent, text="基团构建模式（快速 · 非完备）",
+                            padding="6")
+        lf.pack(fill=tk.X, pady=(2, 4))
+        row = None
+        for i, g in enumerate(list_groups()):
+            if i % 6 == 0:
+                row = ttk.Frame(lf)
+                row.pack(fill=tk.X, anchor='w')
+            var = tk.BooleanVar(value=False)
+            cnt = tk.IntVar(value=1)
+            self.group_vars[g.key] = (var, cnt)
+            ttk.Checkbutton(row, text=g.name, variable=var).pack(
+                side=tk.LEFT, padx=(2, 0))
+            ttk.Spinbox(row, from_=1, to=3, width=2, textvariable=cnt).pack(
+                side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            lf,
+            text=("勾选后走「碳骨架 + 所选基团」构建：秒级出结果"
+                  "（例 C6H5NO2 + 硝基 → 硝基苯）；"
+                  "不含杂原子在环内/链中的结构（吡啶、环氧等）。"),
+            foreground='#555555', wraplength=820,
+            justify='left').pack(anchor='w', pady=(3, 0))
+
+    def _selected_groups(self):
+        """当前勾选的基团 ``{key: 个数}``（未勾选返回空 dict）"""
+        out = {}
+        for k, pair in getattr(self, 'group_vars', {}).items():
+            try:
+                var, cnt = pair
+                if var.get():
+                    out[k] = max(1, int(cnt.get()))
+            except Exception:
+                pass
+        return out
+
+    # ── 流式反馈（E）：计算中实时显示"已发现 N 个结构" ──────────────
+    def _stream_reset(self):
+        self._stream_n = 0
+        self._stream_last = 0.0
+
+    def _stream_offer(self, graphs):
+        """由**生成线程**调用：按 ~1s 限频把"已发现数量"推到界面（主线程刷新）"""
+        try:
+            self._stream_n += len(graphs or [])
+            now = time.time()
+            if now - self._stream_last < 1.0:
+                return
+            self._stream_last = now
+            n = self._stream_n
+            self.root.after(0, self._stream_show, n)
+        except Exception:
+            pass
+
+    def _stream_show(self, n):
+        """主线程：更新状态/进度文字（不触碰列表，避免与最终填充冲突）"""
+        try:
+            if self.window_closed:
+                return
+            self.status_var.set(f"计算中... 已发现 {n} 个结构（持续追加）")
+            self.progress_label.config(text=f"已发现 {n} 个结构...")
+        except tk.TclError:
+            pass
+
+    def _stream_flush(self):
+        """生成结束：把最终数量刷到界面"""
+        try:
+            self._stream_show(self._stream_n)
+        except Exception:
+            pass
+
     def _open_advanced_filter(self):
         """打开高级结构筛选对话框"""
         from structure_filter import (
@@ -1335,7 +1486,7 @@ class MoleculeApp:
         formula_str = self.molecule_input.get().strip()
         nc, nh, no, halo_spec, k = 0, 0, 0, (0, 0, 0, 0), 0
         if formula_str:
-            (_, nc, nh, no, halo_spec, _, err) = parse_compound_formula(formula_str)
+            (_, nc, nh, no, halo_spec, _, err, _n_n) = parse_compound_formula(formula_str)
             if err:
                 nc = nh = no = 0
             total_halo = sum(halo_spec)
@@ -1682,13 +1833,78 @@ class MoleculeApp:
         # 整合分子式解析（C+H+O+卤素+氘代）
         from utils import parse_compound_formula
         (mol_types, n_carbon, n_hydrogen, n_oxygen,
-         halogen_spec, n_deuterium, error) = parse_compound_formula(formula_str)
+         halogen_spec, n_deuterium, error, n_nitrogen) = parse_compound_formula(formula_str)
         if error:
             messagebox.showwarning("输入错误", error)
             return
         
         self._current_n_hydrogen = n_hydrogen
         total_halogen = sum(halogen_spec)
+
+        # ── 基团构建模式（勾选了基团 → 跳过完整枚举，走极速构建）──
+        _group_counts = self._selected_groups()
+        if _group_counts:
+            from group_builder import derive_parent
+            _parent, _perr = derive_parent(
+                (n_carbon, n_hydrogen, n_nitrogen, n_oxygen, halogen_spec),
+                _group_counts)
+            if _perr:
+                messagebox.showwarning(
+                    "基团构建模式不适用",
+                    f"{_perr}\n\n提示：取消基团勾选可回到「完整枚举」模式。",
+                    parent=self.root)
+                return
+            _names = '、'.join(f"{k}×{v}" for k, v in _group_counts.items())
+            if not messagebox.askyesno(
+                    "基团构建模式",
+                    f"已勾选基团：{_names}\n"
+                    f"将采用「碳骨架 + 基团挂载」构建（母体骨架 "
+                    f"C{_parent[0]}H{_parent[1]}），秒级完成。\n\n"
+                    f"⚠ 该模式**非完备**：不包含杂原子位于环内/链中的结构"
+                    f"（如吡啶、环氧）。\n若需要完备结果，请取消基团勾选后重试。\n\n"
+                    f"是否继续？",
+                    parent=self.root):
+                return
+        self._pending_group_counts = _group_counts
+
+        # ── 含氮：重原子上限预检 + 耗时确认（§13.2-Step3 约定）──
+        #   路线 A（2026-09-21）起含氮可带 O → 重原子数 = nC + nN + nO
+        if n_nitrogen > 0:
+            n_heavy = n_carbon + n_nitrogen + n_oxygen
+            if n_heavy > _N_MAX_ATOMS:
+                messagebox.showwarning(
+                    "超出上限",
+                    f"含氮分子重原子数 {n_heavy} 超过枚举上限 {_N_MAX_ATOMS}。\n"
+                    f"预言机枚举量随重原子数急剧增长，请减小分子式规模。")
+                return
+            if n_heavy >= 7:
+                # ── 代价预估（F）：避免用户白等数小时 ──
+                _eta_txt = ""
+                try:
+                    from Nitrogen.atomic_matrix_n import estimate_cost
+                    _est = estimate_cost(n_carbon, n_nitrogen, n_oxygen,
+                                         n_hydrogen, t_cap=2.5)
+                    if _est.get('too_slow'):
+                        _eta_txt = ("预计耗时：**远超数分钟**（可能数小时）。\n"
+                                    f"  （探测：{_est.get('timeout') or '单个子树未在限时内完成'}）\n")
+                    elif _est.get('estimable'):
+                        _s = _est['est_seconds_parallel']
+                        _t = (f"{_s:.0f} 秒" if _s < 90
+                              else (f"{_s/60:.1f} 分钟" if _s < 5400
+                                    else f"{_s/3600:.1f} 小时"))
+                        _eta_txt = (f"预计结构数 ≈ {_est['est_structures']:,}，"
+                                    f"预计耗时 ≈ {_t}（8 核并行）\n")
+                except Exception:
+                    _eta_txt = ""
+                _hint = ("\n💡 若目标只是「碳骨架 + 硝基/氨基等基团」"
+                         "（如 C6H5NO2 的硝基苯），请在上方勾选**基团构建模式**"
+                         "：秒级完成，且能给出完整枚举拿不到的结构。\n")
+                if not messagebox.askyesno(
+                        "含氮枚举耗时提示",
+                        f"含氮完备枚举：重原子数 = {n_heavy}。\n\n"
+                        f"{_eta_txt}{_hint}\n是否继续完整枚举？",
+                        parent=self.root):
+                    return
 
         # 确定要生成的分子类型
         type_filter = self.type_filter_var.get()
@@ -1728,7 +1944,8 @@ class MoleculeApp:
         thread = threading.Thread(
             target=self._generate_in_background,
             args=(target_types, n_carbon, type_filter, halogen_spec, n_oxygen,
-                  constraint, n_deuterium)
+                  constraint, n_deuterium, n_nitrogen),
+            kwargs={'group_counts': getattr(self, '_pending_group_counts', None)}
         )
         thread.daemon = True
         thread.start()
@@ -1741,8 +1958,9 @@ class MoleculeApp:
 
     def _generate_in_background(self, target_types, n_carbon, type_filter='all',
                                  halogen_spec=(0, 0, 0, 0), n_oxygen=0,
-                                 constraint=None, n_deuterium=0):
-        """在后台线程中生成异构体（支持 O + 卤素取代 + 高级筛选）"""
+                                 constraint=None, n_deuterium=0, n_nitrogen=0,
+                                 group_counts=None):
+        """在后台线程中生成异构体（支持 N / O + 卤素取代 + 高级筛选）"""
         try:
             cancelled = False
             all_isomers = []       # [(mol_type, isomer_data), ...]
@@ -1757,8 +1975,77 @@ class MoleculeApp:
 
             n_hydrogen = getattr(self, '_current_n_hydrogen', None)
 
+            # ── 基团构建模式（勾选基团 → 跳过完整枚举）──────────────────
+            #   目标式 → 反推母体骨架 → 骨架枚举（快）+ 基团挂载位置枚举 → 门禁。
+            #   例：C6H5NO2 + 硝基 → 硝基苯（秒级；完整枚举需数小时且拿不到硝基苯）。
+            self._build_mode_info = None
+            if group_counts:
+                from group_builder import build_from_groups
+                self._update_progress(10, "基团构建模式：枚举母体骨架并挂载...")
+                _res = build_from_groups(
+                    (n_carbon, n_hydrogen, n_nitrogen, n_oxygen, halogen_spec),
+                    group_counts,
+                    lambda c, h: self.gen_mgr.generate_all(c, h))
+                self._build_mode_info = _res
+                if _res.error:
+                    raise ValueError(_res.error)
+                for _g in _res.graphs:
+                    if self.cancel_requested or self.window_closed:
+                        cancelled = True
+                        break
+                    all_isomers.append(('nitrogen', _g))
+                type_counts = {'nitrogen': len(all_isomers)} if all_isomers else {}
+
+            # ── 含氮模式（C/H/N，可含 O，可含卤素）：预言机 + 卤素后处理 ──
+            # 依据 §13.2-Step3：Nitrogen/README §6 实测"机制 A 产物 ≡ 预言机"但更慢
+            # （0.56~0.76×），故 GUI 走 AtomicMatrixNGenerator（更快且完备）。
+            # 产出已是 nx.Graph（label='C'/'N'/'O' + bond_type），无需规范字符串转换；
+            # 去重已由预言机内部完成（碰撞安全），此处**不得**再套一层裸 set。
+            # 路线 A（2026-09-21）：n_oxygen 一并交给预言机（口径 C=4/N=3/O=2）。
+            # 卤素组合（2026-09-21 起）：卤素**替代 H** → 预言机按"骨架 H = 用户 H +
+            # 卤素数"枚举，再走与烃类相同的 HalogenSubstitutionGenerator 取代位置枚举。
+            if group_counts:
+                type_counts = type_counts                     # 已在构建分支处理
+            elif n_nitrogen > 0:
+                from Nitrogen import AtomicMatrixNGenerator
+                n_heavy = n_carbon + n_nitrogen + n_oxygen
+                if n_heavy > _N_MAX_ATOMS:
+                    raise ValueError(
+                        f"含氮分子重原子数 {n_heavy} 超过枚举上限 {_N_MAX_ATOMS}，"
+                        f"请减小分子式规模。")
+                self._update_progress(10, "生成含氮异构体（完备枚举，请稍候）...")
+                _n_gen = AtomicMatrixNGenerator(n_carbon, n_nitrogen, n_oxygen)
+                if not _n_gen._can_enumerate():
+                    raise ValueError(
+                        f"含氮分子重原子数 {n_heavy} 无法枚举"
+                        f"（预言机上限 {_N_MAX_ATOMS}）。")
+                _skeleton_h = n_hydrogen + total_halogen   # 卤素替代 H
+                # 缓存（D）+ 流式（E）：重复分子式秒回；计算中实时显示已发现数量
+                from Nitrogen.oracle_cache import generate_cached
+                self._stream_reset()
+                _n_graphs, _cinfo = generate_cached(
+                    n_carbon, n_nitrogen, n_oxygen, _skeleton_h,
+                    parallel=True, max_atoms=_N_MAX_ATOMS,
+                    stream_cb=self._stream_offer)
+                if _cinfo.get('hit'):
+                    self._update_progress(60, f"命中缓存：{_cinfo['n']} 个结构")
+                self._stream_flush()
+                for _g in _n_graphs:
+                    if self.cancel_requested or self.window_closed:
+                        cancelled = True
+                        break
+                    all_isomers.append(('nitrogen', _g))
+
+                # ── 卤素取代位置枚举（与烃类同一套机制）──
+                if total_halogen > 0 and all_isomers:
+                    self._update_progress(60, "枚举卤素取代位置...")
+                    _hgen = HalogenSubstitutionGenerator()
+                    all_isomers = _hgen.generate(all_isomers, halogen_spec,
+                                                 n_carbon)
+                type_counts = {'nitrogen': len(all_isomers)} if all_isomers else {}
+
             # ── 含氧模式：使用统一含氧生成器（锁定用户输入的不饱和度） ──
-            if n_oxygen > 0:
+            elif n_oxygen > 0:
                 self._update_progress(10, "生成含氧异构体...")
                 # 根据输入公式计算不饱和度 k（卤素视为 H 替代）
                 h_equiv = n_hydrogen + sum(halogen_spec)
@@ -1925,6 +2212,7 @@ class MoleculeApp:
                     halogen_spec,
                     n_deuterium,
                     to_graph_fn=lambda mt, d: _canon_to_graph(d, mt, self.gen_mgr),
+                    n_nitrogen=n_nitrogen,
                 )
                 if before_f != len(all_isomers):
                     print(f"  分子式门禁: 剔除 {before_f - len(all_isomers)} 个"
@@ -1955,7 +2243,8 @@ class MoleculeApp:
             # 更新界面
             if not self.window_closed:
                 self.root.after(0, self._update_isomer_list, all_isomers, target_types,
-                                n_carbon, type_counts, cancelled, halogen_spec, n_oxygen)
+                                n_carbon, type_counts, cancelled, halogen_spec, n_oxygen,
+                                n_nitrogen)
 
         except Exception as e:
             if not self.window_closed:
@@ -1986,11 +2275,11 @@ class MoleculeApp:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def _build_display_meta(self, all_isomers, n_carbon, n_oxygen=0,
-                            halogen_spec=(0, 0, 0, 0)):
+                            halogen_spec=(0, 0, 0, 0), n_nitrogen=0):
         """计算每个异构体的展示元数据，缓存在 self._display_meta。
 
         meta[idx] = (formula, cn_name, feature, fg_tags, o_dist)
-          formula: 实际分子式（含 O/卤素）；feature: 主链长度/环大小特征值；
+          formula: 实际分子式（含 N/O/卤素）；feature: 主链长度/环大小特征值；
           fg_tags: 含氧官能团标签集合（frozenset，纯图判定，无 O 时为空）；
           o_dist: O 分布形态（'substituent_only'/'backbone_only'/'mixed'/'none'）。
         """
@@ -2017,6 +2306,17 @@ class MoleculeApp:
                 # 由 _start_fg_tags_computation 同步（小集合）或后台分块
                 # （大集合）填充 _fg_tags_cache（见 4.10）
                 meta.append((formula, cn_name, feat, None, None))
+        elif n_nitrogen > 0:
+            # 含氮（第一阶段纯 C/H/N）：分子式走统一事实源（自带 N 前缀）
+            from utils import format_graph_formula
+            for mol_type, data in all_isomers:
+                if hasattr(data, 'nodes'):
+                    formula = format_graph_formula(data)
+                else:
+                    formula = f"C{n_carbon}H?"
+                cn_name = mol_names.get(mol_type, mol_type)
+                feat = self._calculate_main_chain_length(data, mol_type)
+                meta.append((formula, cn_name, feat, frozenset(), 'none'))
         elif has_halogen:
             halogen_gen = HalogenSubstitutionGenerator()
             for mol_type, data in all_isomers:
@@ -2297,7 +2597,8 @@ class MoleculeApp:
                            self._tags_flow_children)
 
     def _update_isomer_list(self, all_isomers, target_types, n_carbon, type_counts,
-                             cancelled=False, halogen_spec=(0, 0, 0, 0), n_oxygen=0):
+                             cancelled=False, halogen_spec=(0, 0, 0, 0), n_oxygen=0,
+                             n_nitrogen=0):
         """更新异构体列表"""
         if self.window_closed:
             return
@@ -2325,7 +2626,8 @@ class MoleculeApp:
             n_hydrogen = getattr(self, '_current_n_hydrogen', None)
 
             # 统一计算展示元数据（分子式 / 骨架类型 / 特征值）
-            self._build_display_meta(all_isomers, n_carbon, n_oxygen, halogen_spec)
+            self._build_display_meta(all_isomers, n_carbon, n_oxygen, halogen_spec,
+                                     n_nitrogen)
 
             # 构建特征值筛选数据（复用 _display_meta，避免重复计算）
             self._update_filter_options(all_isomers,
@@ -2343,6 +2645,8 @@ class MoleculeApp:
 
             total_count = len(all_isomers)
             suffix_parts = []
+            if n_nitrogen > 0:
+                suffix_parts.append(f"{n_nitrogen}N")
             if n_oxygen > 0:
                 suffix_parts.append(f"{n_oxygen}O")
             if total_halogen > 0:
@@ -2378,7 +2682,32 @@ class MoleculeApp:
             self._show_skeletal_placeholder("选择异构体查看键线式")
             self.info_text.delete(1.0, tk.END)
 
-            if n_oxygen > 0:
+            if n_nitrogen > 0:
+                # 含氮信息（路线 A 起可为 C/H/N/O）
+                _no_part = f"O{n_oxygen}" if n_oxygen > 0 else ""
+                _heavy_part = (f"C{n_carbon} + N{n_nitrogen}"
+                               + (f" + O{n_oxygen}" if n_oxygen > 0 else ""))
+                info = f"""分子式: C{n_carbon}H{n_hydrogen}N{n_nitrogen}{_no_part}
+
+重原子: {_heavy_part} = {n_carbon + n_nitrogen + n_oxygen}
+
+异构体数量: {total_count}
+
+提示:
+- 点击列表中的异构体查看详情
+- 含氮结构采用完备枚举（原子矩阵预言机），计数为图口径（凯库勒变体分开计）
+- 键线式 / 3D 可视化 / .gjf 导出均已支持（第二期接入）
+"""
+                _bmi = getattr(self, '_build_mode_info', None)
+                if _bmi is not None:
+                    info += (f"\n⚠ **基团构建模式（非完备）**\n"
+                             f"- 母体骨架: {_bmi.parent_formula}（{_bmi.n_skeletons} 个）\n"
+                             f"- 挂载方案: {_bmi.n_placements}，门禁剔除: "
+                             f"{_bmi.n_gate_rejected}\n"
+                             f"- 仅含「碳骨架 + 所选基团」结构；不含杂原子位于"
+                             f"环内/链中的结构（吡啶、环氧等）\n"
+                             f"- 需要完备结果请取消基团勾选后重新生成\n")
+            elif n_oxygen > 0:
                 # 含氧信息
                 oxy_info = f"O={n_oxygen}"
                 spec_str = format_halogen_spec(halogen_spec) if total_halogen > 0 else ""
@@ -2668,9 +2997,12 @@ class MoleculeApp:
 
             formulas = {mt: compute_formula(mt, n_carbon, getattr(self, '_current_n_hydrogen', None)) for mt in mol_names}
 
-            # 卤代/含氧：覆盖分子式为实际分子式
+            # 卤代/含氧/含氮：覆盖分子式为实际分子式
             actual_formula = None
-            if has_oxygen and isinstance(isomer_data, nx.Graph):
+            if mol_type == 'nitrogen' and isinstance(isomer_data, nx.Graph):
+                from utils import format_graph_formula
+                actual_formula = format_graph_formula(isomer_data)
+            elif has_oxygen and isinstance(isomer_data, nx.Graph):
                 from oxygen.oxo_generator import OxoSubstituentGenerator
                 oxo_gen = OxoSubstituentGenerator()
                 actual_c = sum(1 for n in isomer_data.nodes() if isomer_data.nodes[n].get('label', 'C') == 'C')
@@ -2708,6 +3040,9 @@ class MoleculeApp:
                 else:
                     info = self._get_graph_info_text(isomer_data, idx, mol_type, formulas,
                                                       halogen_formula=actual_formula)
+            elif mol_type == 'nitrogen':
+                info = self._get_graph_info_text(isomer_data, idx, mol_type, formulas,
+                                                  halogen_formula=actual_formula)
             else:
                 info = f"异构体 #{idx+1}"
 
@@ -2727,6 +3062,9 @@ class MoleculeApp:
         self._formula_canvas.delete("all")
         self._formula_photo = None
         self._skeletal_png_data = None  # 原始 PNG 字节（供右键复制/另存用）
+
+        # 含氮结构（第二期已支持）：graph_to_rdkit_mol 已映射 label='N'
+        # （元素价态 C=4/N=3/O=2），与烃/含氧/卤代共用同一渲染路径。
 
         if not HAS_SKELETAL_DRAWING:
             self._show_skeletal_placeholder("键线式渲染不可用\n请安装: pip install cairosvg Pillow")
@@ -2868,6 +3206,51 @@ class MoleculeApp:
         mol_names = MOL_NAMES_FILTER
         has_halogen = halogen_formula is not None
         has_oxygen = self.parsed_n_oxygen > 0
+
+        # ── 含氮结构（第一阶段纯 C/H/N）：用统一事实源统计 ──
+        #  逐原子的既有分支对 N 会误判（max_v 取 2、H 数落入 2n 口径），故单独收口。
+        if mol_type == 'nitrogen':
+            from utils import graph_formula_parts_full, format_graph_formula
+            _n_c, _n_h, _n_n, _n_o, _halo = graph_formula_parts_full(G)
+            _adj_lines = []
+            for _node in sorted(G.nodes()):
+                _lbl = G.nodes[_node].get('label', 'C')
+                _nbs = sorted(f"{G.nodes[_x].get('label', 'C')}{_x + 1}"
+                              for _x in G.neighbors(_node))
+                _adj_lines.append(f"{_lbl}{_node + 1}: 连接的原子 -> {_nbs}")
+            _dbl = sum(1 for u, v, d in G.edges(data=True)
+                       if d.get('bond_type') == 'double')
+            _tpl = sum(1 for u, v, d in G.edges(data=True)
+                       if d.get('bond_type') == 'triple')
+            _txt = f"""【异构体 #{idx+1} 详细信息】
+
+分子类型: {mol_names.get(mol_type, mol_type)}
+分子式: {format_graph_formula(G)}
+
+原子统计:
+  - 碳原子数: {_n_c}
+  - 氮原子数: {_n_n}
+{('  - 氧原子数: ' + str(_n_o) + chr(10)) if _n_o > 0 else ''}  - 氢原子数: {_n_h}
+  - 重原子数: {G.number_of_nodes()}
+  - 总原子数: {G.number_of_nodes() + _n_h}
+
+化学键统计:
+  - 总键数: {G.number_of_edges()}
+  - 双键数: {_dbl}
+  - 三键数: {_tpl}
+
+重原子连接关系:
+"""
+            for _line in _adj_lines:
+                _txt += f"  {_line}\n"
+            _txt += "\n提示: 含氮结构的键线式 / 3D 可视化 / .gjf 导出均已支持。\n"
+            if getattr(self, '_build_mode_info', None) is not None:
+                _b = self._build_mode_info
+                _txt += (f"\n⚠ 基团构建模式（非完备）：母体骨架 {_b.parent_formula}，"
+                         f"挂载方案 {_b.n_placements} 个。\n"
+                         f"   本模式不含杂原子位于环内/链中的结构（吡啶、环氧等）；"
+                         f"完备结果请取消基团勾选。\n")
+            return _txt
 
         # 获取图的基本信息
         n_atoms = G.number_of_nodes()
@@ -4339,6 +4722,9 @@ class MoleculeApp:
         # 获取列表项的内容来解析原始索引
         idx = self._get_original_index(list_idx)
 
+        # 含氮结构（第二期已支持）：_build_rdkit_mol 已将 label='N' 建为氮原子
+        # （3 价），坐标算法与绘图按重原子处理，不再需要单独拦截。
+
         mol_type = self.current_molecule_type
         n_carbon = self.current_carbon_count
 
@@ -4397,6 +4783,17 @@ class MoleculeApp:
                 formula = format_formula(n_carbon, self._current_n_hydrogen) if hasattr(self, '_current_n_hydrogen') and self._current_n_hydrogen is not None else (f"CH?" if n_carbon == 1 else f"C{n_carbon}H?")
                 desc = self.unified_generator.describe_isomer(isomer)
                 self.unified_generator.visualize_isomer(isomer, title=f"{formula} 多环多烯炔烃 #{idx+1} ({desc})")
+            elif isomer_mol_type == 'nitrogen':
+                # 含氮（第二期接入）：纯 C/H/N，N 以蓝色标注元素符号
+                _fml = format_graph_formula(isomer) if hasattr(isomer, 'nodes') else "含氮化合物"
+                self._visualize_nitrogen(isomer, f"{_fml} 含氮化合物 #{idx+1}")
+            else:
+                # 未覆盖类型：明确提示，避免"点了没反应"
+                messagebox.showinfo(
+                    "暂不支持",
+                    f"类型 '{isomer_mol_type}' 暂不支持 3D 可视化。\n"
+                    f"当前可查看右侧结构信息与键线式。",
+                    parent=self.root)
         except tk.TclError:
             pass  # 窗口已关闭
         except Exception as e:
@@ -4597,6 +4994,10 @@ class MoleculeApp:
             indices = list(range(len(self.current_isomers)))
             label = f"共 {len(indices)} 个异构体"
 
+        # 含氮结构（第二期已支持）：_extract_coords 已改为收集**全部重原子**
+        # （非氢），_build_rdkit_mol 已把 label='N' 建为氮原子，且 element_of
+        # 已接入 gaussian_export.build_gjf —— 不再需要拦截。
+
         self.current_molecule_type
         n_carbon = self.current_carbon_count
 
@@ -4763,14 +5164,27 @@ class MoleculeApp:
                 else:
                     G = None
 
+                # ── 展开取代基为显式原子（含氧 / 卤代导出正确性的关键）──
+                # 骨架+取代基模型下，OH/=O/卤素不是节点；若不展开，`.gjf`
+                # 会静默丢掉这些原子并把 H 数按骨架补齐（历史缺陷 §16.1）。
+                _from_graph = isinstance(G, nx.Graph)
+                if _from_graph:
+                    G = expand_substituent_graph(G)
+
                 # 写文件（使用原始编号保持与坐标一致）
-                filename = f"{formulas[mol_type]}_{mol_names.get(mol_type, mol_type)}_{i + 1:03d}.gjf"
+                # 分子式取统一事实源（含 N / O / 卤 均正确）；
+                # 仅当条目来自"规范字符串"（无键级信息）时退回类型公式。
+                if _from_graph:
+                    fml_file = format_graph_formula(G)
+                else:
+                    fml_file = formulas.get(mol_type, f"C{n_carbon}H?")
+                filename = f"{fml_file}_{mol_names.get(mol_type, mol_type)}_{i + 1:03d}.gjf"
                 filepath = save_folder / filename
 
                 # %Chk 与 .gjf 同名（去扩展名），便于 formchk / cubegen 与 restart
                 content = self._generate_gjf_content(
                     G, c_coords, h_coords, mol_type, n_carbon, i + 1,
-                    chk_name=filename[:-4],
+                    chk_name=filename[:-4], formula=fml_file,
                 )
                 with open(filepath, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(content)
@@ -4977,14 +5391,25 @@ class MoleculeApp:
 
 
     def _generate_gjf_content(self, G, c_coords, h_coords, mol_type, n_carbon, index,
-                              chk_name=None):
+                              chk_name=None, formula=None):
         """使用预计算坐标生成 .gjf 文件内容（用于并行导出）
 
         实际格式由 ``gaussian_export.build_gjf`` 负责（唯一出口）；本方法只做
         「坐标准备 + 标题组装」两件事。
+
+        Args:
+            formula: 由调用方传入的**真实分子式**（统一事实源
+                ``utils.format_graph_formula`` 的结果，含 N/O/卤素均正确）。
+                未传入时按类型公式回退（仅用于无键级信息的字符串条目）。
         """
         formulas = {mt: compute_formula(mt, n_carbon, getattr(self, '_current_n_hydrogen', None)) for mt in MOL_NAMES_EN}
         mol_names = MOL_NAMES_EN
+        if formula is not None:
+            fml_here = formula
+        elif mol_type == 'nitrogen' and G is not None:
+            fml_here = format_graph_formula(G)
+        else:
+            fml_here = formulas.get(mol_type, f"C{n_carbon}H?")
 
         # 缩放键长至真实值（包括C-H键长）
         if G is not None and mol_type in ('cycloalkane', 'cycloalkene', 'alkene', 'diene', 'alkyne', 'alkenyl', 'triene', 'tetraene', 'polyene', 'cyclopolyene', 'multcycloalkane', 'multcyclomultalkane'):
@@ -4998,25 +5423,31 @@ class MoleculeApp:
             c_coords = {i: (1.5 * math.cos(2 * math.pi * i / n_nodes),
                             1.5 * math.sin(2 * math.pi * i / n_nodes),
                             0.0) for i in range(n_nodes)}
+            _VAL = {'C': 4, 'N': 3, 'O': 2, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
             for node in sorted(G.nodes()):
+                label = G.nodes[node].get('label', 'C')
+                valence = _VAL.get(label, 4)      # 按元素价态（含卤素 1 价）
                 bond_load = 0
                 for nb in G.neighbors(node):
                     bt = G[node][nb].get('bond_type', 'single')
                     bond_load += 2 if bt == 'double' else (3 if bt == 'triple' else 1)
-                h_count = max(0, 4 - bond_load)
+                h_count = max(0, valence - bond_load)
                 cx, cy, cz = c_coords[node]
                 for j in range(h_count):
                     ha = 2 * math.pi * j / max(h_count, 1) + node * 0.5
                     h_coords.append((cx + 1.09 * math.cos(ha),
                                      cy + 1.09 * math.sin(ha), cz))
 
-        title = f"{formulas[mol_type]} {mol_names[mol_type]} Isomer #{index}"
+        title = f"{fml_here} {mol_names.get(mol_type, mol_type)} Isomer #{index}"
         if chk_name is None:
-            chk_name = f"{formulas[mol_type]}_{mol_names[mol_type]}_{index:03d}"
+            chk_name = f"{fml_here}_{mol_names.get(mol_type, mol_type)}_{index:03d}"
+        # element_of：把图节点 label 传给导出层（含杂原子必须，否则按碳骨架处理）
+        _elem_fn = (lambda n, _G=G: _G.nodes[n].get('label', 'C')) if G is not None else None
         result = build_gjf(
             title, c_coords, h_coords, G,
             settings=self._get_gjf_settings(),
             chk_name=chk_name,
+            element_of=_elem_fn,
         )
         self._log_gjf_warnings(result, index)
         return result.text
@@ -5856,6 +6287,57 @@ class MoleculeApp:
 
         except Exception as e:
             messagebox.showerror("可视化错误", f"环烷烃可视化失败: {str(e)}")
+
+    def _visualize_nitrogen(self, G, title):
+        """可视化单个含氮异构体（第二期接入）。
+
+        含氮图 ``label='C'/'N'``（无 oxo/halogen 属性）：
+          · 坐标：``_rdkit_coords_with_bonds``（``_build_rdkit_mol`` 已把 N 建为
+            3 价氮原子；含环 / 多重键共用多种子策略）；
+          · 绘制：C 黑 / **N 蓝并标注元素符号**；H 白点 + 就近重原子的灰色连线；
+            重原子间所有键由 ``_draw_cc_bonds`` 统一绘制（因 c_coords 含 N，
+            C–N 键会一并画出）。
+        """
+        try:
+            import math
+            # 含卤素等的骨架+取代基模型 → 先展开为显式原子（否则卤素/O 不在图里，
+            # 3D 与 .gjf 会缺原子）；节点模型（纯 N/N+O）为恒等。
+            G = expand_substituent_graph(G)
+            c_coords, h_coords = _rdkit_coords_with_bonds(G, double_only=False)
+
+            if not c_coords:
+                messagebox.showwarning("无法可视化",
+                                       "该含氮结构未能生成有效 3D 坐标。")
+                return
+
+            fig, ax = _build_3d_axes(title)
+            _draw_cc_bonds(ax, G, c_coords, linewidth=2)
+
+            # 重原子：按元素着色（C 黑 / N 蓝 / O 红），杂原子额外标注元素符号
+            _COLOR = {'C': 'black', 'N': '#1f4fd8', 'O': '#cc2222'}
+            for n in sorted(c_coords):
+                lab = G.nodes[n].get('label', 'C') if n in G.nodes else 'C'
+                color = _COLOR.get(lab, 'black')
+                ax.scatter([c_coords[n][0]], [c_coords[n][1]], [c_coords[n][2]],
+                           c=color, s=150, zorder=5)
+                if lab != 'C':
+                    ax.text(c_coords[n][0], c_coords[n][1], c_coords[n][2] + 0.18,
+                            lab, fontsize=10, color=color, fontweight='bold')
+
+            # 氢：白点 + 就近重原子的灰色连线
+            if h_coords:
+                for h in h_coords:
+                    ax.scatter([h[0]], [h[1]], [h[2]], c='white',
+                               edgecolors='gray', s=80, zorder=5)
+                    parent = min(c_coords, key=lambda k: math.dist(
+                        (h[0], h[1], h[2]), tuple(c_coords[k])))
+                    c0 = c_coords[parent]
+                    ax.plot([c0[0], h[0]], [c0[1], h[1]], [c0[2], h[2]],
+                            'gray', linewidth=1, alpha=0.7, zorder=4)
+
+            _finish_3d_plot(ax)
+        except Exception as e:
+            messagebox.showerror("可视化错误", f"含氮结构可视化失败: {str(e)}")
 
     def _visualize_multcycloalkane(self, G, title):
         """可视化多环烷烃异构体（优先使用 RDKit 构建高质量3D坐标）"""

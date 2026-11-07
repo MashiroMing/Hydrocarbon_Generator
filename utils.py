@@ -30,6 +30,7 @@ MOL_NAMES_CN = {
     'multcycloalkane': '多环烷烃',
     'multcyclomultalkane': '多环多烯炔烃',
     'benzene': '苯环',
+    'nitrogen': '含氮化合物',
 }
 
 MOL_NAMES_FILTER = {
@@ -47,6 +48,7 @@ MOL_NAMES_FILTER = {
     'multcycloalkane': '多环烷烃',
     'multcyclomultalkane': '多环多烯炔烃',
     'benzene': '苯环',
+    'nitrogen': '含氮化合物',
 }
 
 MOL_NAMES_EN = {
@@ -64,6 +66,7 @@ MOL_NAMES_EN = {
     'multcycloalkane': 'Polycycloalkane',
     'multcyclomultalkane': 'Polycyclic Polyene',
     'benzene': 'Benzene',
+    'nitrogen': 'Nitrogen',
 }
 
 # 不支持的分子式错误提示
@@ -188,83 +191,118 @@ def parse_molecule_input(formula_str):
 # 整合分子式解析：C{n}H{m}O{o} + 卤素 + 氘
 # ─────────────────────────────────────────────
 
-_SUPPORTED_ELEMENTS = "C、H、O 以及卤素 F、Cl、Br、I / 氘代 D"
+_SUPPORTED_ELEMENTS = "C、H、N、O 以及卤素 F、Cl、Br、I / 氘代 D"
 
+# 含氮 + 含氧 + 卤素 **全部组合均支持**（2026-09-21 起）：
+#   · N 系预言机负责 C/H/N/O 骨架（价态 C=4 / N=3 / O=2）；
+#   · 卤素由 HalogenSubstitutionGenerator 在骨架上做"取代 H"的后处理
+#     （与烃类同一套机制，已扩展为按元素价态计算可用位置）；
+#   · 因此不再存在任何"含氮与含氧/含卤素互斥"的限制。
+# 历史消息保留在开发过程.md §十三/§十五/§十六，便于追溯。
 
 def parse_compound_formula(formula_str: str):
-    """解析完整分子式（含 O、卤素、氘代），返回统一结构
+    """解析完整分子式（含 N、O、卤素、氘代），返回统一结构
 
-    格式: C{n}H{m}O{o} 后跟任意顺序的卤素 (F/Cl/Br/I) 和氘 (D)
-    例: C3H6O3, C2H6OClBr, C6H6, C2H6OD, C3H6Cl2
+    格式: C{n}H{m}[N{n}][O{o}] 后跟任意顺序的卤素 (F/Cl/Br/I) 和氘 (D)
+    例: C3H6O3, C2H6OClBr, C6H6, C2H6OD, C3H6Cl2, C2H7N, C5H5N
 
     Returns:
         (mol_types, n_carbon, n_hydrogen, n_oxygen,
-         halogen_spec, n_deuterium, error)
+         halogen_spec, n_deuterium, error, n_nitrogen)
         halogen_spec: (f, cl, br, i) 元组
+
+    ⚠ **返回值为 8 元组**：`n_nitrogen` 追加在**末位**，`error` 仍保持第 7 位
+      （故 `res[6]` 取 error 的既有写法不受影响）。按位置解包的调用点必须
+      一次性改完，否则抛 `ValueError: too many values to unpack`。
+
+    口径:
+      - 含氮自**路线 A（2026-09-21）**起支持 **C/H/N/O**（预言机口径 C=4/N=3/O=2）；
+        与**卤素**同时出现仍报错（卤素走骨架后处理机制，未接入 N 系预言机）；
+      - ⚠ 中性八隅律 **N=3** ⇒ **硝基 -NO₂ 不在枚举空间内**（需 5 价 N 或 N⁺-O⁻）；
+      - 含氮时 H 上限与奇偶校验按**氮规则**：`nH ≤ 2·nC + nN + 2` 且同奇偶（O 不参与）；
+      - `mol_types` 含氮时统一为 `['nitrogen']`（N 系无 (r,d,t) 分类，见 §13.5-1）。
     """
     formula = formula_str.strip()
     if not formula:
-        return None, None, None, None, None, None, "请输入分子式"
+        return None, None, None, None, None, None, "请输入分子式", None
 
     # 逐元素提取（2 字符元素优先避免 Cl/Br 误匹配为 C/B）
-    p = r'(Cl|Br|C|H|O|D|F|I)(\d*)'
+    p = r'(Cl|Br|C|H|O|D|F|I|N)(\d*)'
     matches = re.findall(p, formula, re.IGNORECASE)
     if not matches:
-        return None, None, None, None, None, None, "无法识别该分子式"
+        return None, None, None, None, None, None, "无法识别该分子式", None
 
-    counts = {'C': 0, 'H': 0, 'O': 0, 'D': 0,
+    counts = {'C': 0, 'H': 0, 'N': 0, 'O': 0, 'D': 0,
               'F': 0, 'CL': 0, 'BR': 0, 'I': 0}
     used = set()
     for elem, num in matches:
         elem_upper = elem.upper()
         if elem_upper in used:
-            return None, None, None, None, None, None, f"{elem_upper} 重复出现"
+            return None, None, None, None, None, None, f"{elem_upper} 重复出现", None
         used.add(elem_upper)
         cnt = int(num) if num else 1
         counts[elem_upper] = cnt
 
     n_carbon = counts['C']
     n_hydrogen = counts['H']
+    n_nitrogen = counts['N']
     n_oxygen = counts['O']
     n_deuterium = counts['D']
     halogen_spec = (counts['F'], counts['CL'], counts['BR'], counts['I'])
+    total_halogen = sum(halogen_spec)
 
     # 验证
     if n_carbon < 1:
         return (None, None, None, None, None, None,
-                "分子式需含碳原子。纯无机分子不在支持范围。")
+                "分子式需含碳原子。纯无机分子不在支持范围。", None)
     if n_hydrogen == 0 and n_carbon >= 1:
         # C6 不加 H 等价于 C6H?: 不允许
         return (None, None, None, None, None, None,
-                "分子式需含氢原子，如 CH4、C2H6O")
+                "分子式需含氢原子，如 CH4、C2H6O", None)
+
+    # 组合限制：**已全部解除**（N + O + 卤素任意组合均支持）
+    #   —— 含氮骨架由预言机枚举，卤素随后做"取代 H"后处理。
+
     # 卤素视为 H 替代参与价态/k 计算（每 Cl/Br/I 占 1H，F 也占 1H）
-    total_halogen = sum(halogen_spec)
     total_h_equiv = n_hydrogen + total_halogen
-    if total_h_equiv > 2 * n_carbon + 2:
+    # H 上限：烷烃口径 2nC+2；含氮按氮规则 2nC+nN+2
+    h_upper = 2 * n_carbon + n_nitrogen + 2
+    if total_h_equiv > h_upper:
+        if n_nitrogen > 0:
+            return (None, None, None, None, None, None,
+                    f"H 原子数 ({n_hydrogen}) 超出含氮价态上限 "
+                    f"(2×C + N + 2 = {h_upper})", None)
         return (None, None, None, None, None, None,
                 f"H 原子数 ({n_hydrogen}) + 卤素数 ({total_halogen}) "
-                f"超出碳原子价态上限")
-    if (2 * n_carbon + 2 - total_h_equiv) % 2 != 0:
+                f"超出碳原子价态上限", None)
+    if (h_upper - total_h_equiv) % 2 != 0:
         return (None, None, None, None, None, None,
-                "不饱和度 (k) 非整数，请检查 H 原子数")
+                "不饱和度 (k) 非整数，请检查 H 原子数", None)
 
     if n_deuterium > n_hydrogen:
         return (None, None, None, None, None, None,
-                f"氘代原子数 ({n_deuterium}) 不能超过氢原子总数")
+                f"氘代原子数 ({n_deuterium}) 不能超过氢原子总数", None)
 
     # 验证仅支持的元素
     for ch in formula:
-        if ch.upper() not in 'CHODFCLBRI0123456789':
+        if ch.upper() not in 'CHNODFCLBRI0123456789':
             return (None, None, None, None, None, None,
-                    f"不支持的字符 '{ch}'，仅支持 {_SUPPORTED_ELEMENTS}")
+                    f"不支持的字符 '{ch}'，仅支持 {_SUPPORTED_ELEMENTS}", None)
+
+    # 含氮：统一标签 'nitrogen'（N 系无 (r,d,t) 分类，见 §13.5-1）
+    if n_nitrogen > 0:
+        return (['nitrogen'], n_carbon, n_hydrogen, n_oxygen,
+                halogen_spec, n_deuterium, None, n_nitrogen)
 
     # 复用 parse_molecule_input 推导 mol_types（基于 C+H 等价骨架）
     base_formula = f"C{n_carbon}H{total_h_equiv}"
     mol_types, _, _, base_error = parse_molecule_input(base_formula)
     if base_error:
-        return None, n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, base_error
+        return (None, n_carbon, n_hydrogen, n_oxygen, halogen_spec,
+                n_deuterium, base_error, n_nitrogen)
 
-    return mol_types, n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, None
+    return (mol_types, n_carbon, n_hydrogen, n_oxygen, halogen_spec,
+            n_deuterium, None, n_nitrogen)
 
 
 
@@ -390,10 +428,19 @@ _BOND_TYPE_MAP = {
 }
 
 
+#: 元素默认价态（中性八隅律口径）——与 ``Nitrogen/formula.VALENCE`` 和
+#: ``gaussian_export.ELEMENT_VALENCE`` **保持同一口径**（改一处必须同步改全）。
+#: 注：'O' 的 2 与 'C' 的 4 与旧实现逐位一致，故烃/含氧/卤代路径行为不变；
+#: 'N'=3 是含氮接入所需；卤素按 1 价（显式卤素节点）。
+_ELEMENT_VALENCE = {'C': 4, 'N': 3, 'O': 2, 'H': 1,
+                    'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
+
+
 def graph_to_rdkit_mol(G):
     """将 networkx.Graph（含 bond_type / halogen_counts / oxo_counts）→ RDKit Mol
 
-    节点 label='C'/'O' 区分碳骨架与醚氧骨架节点。
+    节点 label='C'/'O' 区分碳骨架与醚氧骨架节点；含氮结构为 label='C'/'N'
+    （第一阶段纯 C/H/N，N 节点**无** oxo_counts / halogen_counts 属性）。
     """
     try:
         from rdkit import Chem
@@ -441,7 +488,9 @@ def graph_to_rdkit_mol(G):
         for node in sorted(G.nodes()):
             atom_idx = node_to_atom_idx[node]
             label = G.nodes[node].get('label', 'C')
-            max_valence = 4 if label == 'C' else 2
+            # 元素价态表（C=4 / N=3 / O=2）；未知元素沿用旧回退值 2，行为不变
+            # 允许键数：元素基准价 + 形式电荷修正（特殊基团用）
+            max_valence = atom_valence(label, G.nodes[node])
 
             # 计算键负载
             bond_load = 0
@@ -461,7 +510,10 @@ def graph_to_rdkit_mol(G):
                     mol.GetAtomWithIdx(atom_idx).SetNumExplicitHs(h_count)
                 continue
 
-            # ── C 节点：处理卤素 + 氧取代基 ──
+            # ── C / N 节点：处理卤素 + 氧取代基 ──
+            #    N（第一阶段纯 C/H/N）无 halogen_counts / oxo_counts 属性，
+            #    走同一路径即等价于"按 3 价算 H"；后续 N+O / N+卤素阶段
+            #    只需补齐属性即可复用此处逻辑。
             hc = G.nodes[node].get('halogen_counts', (0, 0, 0, 0))
             total_halogen = sum(hc)
             for h_idx, count in enumerate(hc):
@@ -488,6 +540,15 @@ def graph_to_rdkit_mol(G):
                 mol.GetAtomWithIdx(atom_idx).SetNumExplicitHs(h_count)
 
         mol = mol.GetMol()
+        # 形式电荷（特殊基团，如硝基电荷分离式 N⁺/O⁻）——必须在 sanitize 前设置，
+        # 否则 RDKit 会以中性价态判 N 超价而 sanitize 失败
+        for node in sorted(G.nodes()):
+            q = G.nodes[node].get('formal_charge')
+            if q:
+                try:
+                    mol.GetAtomWithIdx(node).SetFormalCharge(int(q))
+                except Exception:
+                    pass
         try:
             Chem.SanitizeMol(mol)
         except Exception:
@@ -811,59 +872,182 @@ def dedup_add_to_buckets(G, mol_type, buckets, node_match, node_label_fn,
 # 不信任调用方传入的碳数参数（历史缺陷：compute_graph_formula 的
 # C 前缀曾直接使用调用方 n_carbon，导致桶键公式与实际图不符）。
 
-def graph_formula_parts(G):
-    """从图中统计真实分子式组成 (nC, nH, nO, (f, cl, br, i))
+# 原子价态（中性八隅律；与 Nitrogen/formula.py::VALENCE 口径对齐）
+# 卤素按 1 价（显式卤素节点用，见 expand_substituent_graph）
+_ATOM_VALENCE = {'C': 4, 'N': 3, 'O': 2, 'F': 1, 'Cl': 1, 'Br': 1, 'I': 1}
 
-    口径与氧取代基/卤素图表示一致（PROJECT_GUIDE 3.1 数据结构）：
-      - 节点 label='C' 最大价 4，label='O'（骨架氧）最大价 2；
-      - 键负载 bond_load = Σ(单键1 / 双键2 / 三键3)；
-      - 取代基占位：-OH 占 1 个 H 位（自身带 1 个 H），=O 占 2 个 H 位，
-        每个卤素占 1 个 H 位；
-      - h = max(0, max_v - bond_load - oh - 2*co - halo)；total_h += h + oh；
-      - nO = Σ(oxo_counts) + 骨架 O 节点数。
+#: 卤素元素标签 → halogen_counts 元组下标
+_HALOGEN_INDEX = {'F': 0, 'Cl': 1, 'Br': 2, 'I': 3}
+_HALOGEN_LABELS = ('F', 'Cl', 'Br', 'I')
+
+
+def atom_valence(label, data=None):
+    """原子的**允许键数**（元素基准价 + 形式电荷修正；`valence_override` 优先）
+
+    规则（**电荷带符号**修正）：
+      - 基准价：C=4 / N=3 / O=2 / 卤素=1（见 :data:`_ELEMENT_VALENCE`）；
+      - 形式电荷 q：允许键数 = 基准价 + q
+        （阳离子可多成键：硝基电荷分离式的 N⁺ 允许 4 键；
+         阴离子少成键：硝基的 O⁻ 只允许 1 键 → **不额外补 H**）；
+      - ``valence_override``（节点属性，若有）直接覆盖，用于非常规基团。
+
+    该函数是"价态 → H 数 / 合法性"的**单一事实源**，供分子式统计、
+    合法性判定与 RDKit 构建共用（special_groups.py 亦复用）。
     """
-    n_c = 0
-    n_o = 0
+    data = data or {}
+    ov = data.get('valence_override')
+    if ov:
+        return int(ov)
+    base = _ELEMENT_VALENCE.get(label, 4)
+    q = int(data.get('formal_charge', 0) or 0)
+    return max(0, base + q)
+
+
+def expand_substituent_graph(G):
+    """把「骨架 + 取代基计数」图展开为**显式原子图**（每个重原子都成为节点）
+
+    两种图模型：
+      · **骨架 + 取代基**（含氧 / 卤代生成器产出）：骨架节点携带
+        ``oxo_counts=(OH,=O)`` 与 ``halogen_counts=(F,Cl,Br,I)``；
+      · **节点模型**（N / N+O 预言机产出）：已是显式原子 → 本函数**原样返回**
+        （恒等、零开销、零风险）。
+
+    返回的显式图：所有重原子都是节点（``label ∈ C/N/O/F/Cl/Br/I``），
+    取代基键为 single（=O 为 double），且**已剥离** ``oxo_counts`` /
+    ``halogen_counts`` 属性（避免与显式节点重复计数）。
+    新节点编号从原最大编号 +1 起**确定性递增**（便于坐标与连通性块对齐）。
+
+    用途：`.gjf` 导出与 3D 坐标必须先展开——否则取代原子根本不存在于
+    分子对象里，会**静默导出错误的输入卡**（历史缺陷，见开发过程.md §16.1）。
+    """
+    import networkx as nx
+
+    has_sub = any(('oxo_counts' in d or 'halogen_counts' in d)
+                  for _, d in G.nodes(data=True))
+    if not has_sub:
+        return G
+
+    H = nx.Graph()
+    for n, d in G.nodes(data=True):
+        H.add_node(n, label=d.get('label', 'C'))
+    for u, v, d in G.edges(data=True):
+        H.add_edge(u, v, bond_type=d.get('bond_type', 'single'))
+
+    next_id = (max(G.nodes()) + 1) if G.number_of_nodes() else 0
+    for n in sorted(G.nodes()):
+        oh, co = G.nodes[n].get('oxo_counts', (0, 0))
+        for _ in range(oh):
+            H.add_node(next_id, label='O')
+            H.add_edge(n, next_id, bond_type='single')
+            next_id += 1
+        for _ in range(co):
+            H.add_node(next_id, label='O')
+            H.add_edge(n, next_id, bond_type='double')
+            next_id += 1
+        hc = G.nodes[n].get('halogen_counts', (0, 0, 0, 0))
+        for lbl, cnt in zip(_HALOGEN_LABELS, hc):
+            for _ in range(cnt):
+                H.add_node(next_id, label=lbl)
+                H.add_edge(n, next_id, bond_type='single')
+                next_id += 1
+    return H
+
+
+def graph_formula_parts_full(G):
+    """从图中统计真实分子式组成 (nC, nH, nN, nO, (f, cl, br, i))
+
+    在既有口径（PROJECT_GUIDE 3.1）上扩展 **label='N'** 支持：
+      - 价态 C=4 / N=3 / O=2（与 Nitrogen/formula.py::VALENCE 对齐），
+        显式卤素节点 F/Cl/Br/I 按 1 价（`expand_substituent_graph` 的产出）；
+      - 键负载 bond_load = Σ(单键1 / 双键2 / 三键3)；
+      - C 节点：h = max(0, 4 − bond_load − oh − 2·co − halo)，另计 OH 上的 1 个 H；
+      - O 骨架节点：h = max(0, 2 − bond_load)，nO 计入；
+      - **N 节点**：N 系（纯 C/H/N 或 C/H/N/O）无 `oxo_counts` / `halogen_counts`
+        占位，直接 h = max(0, 3 − bond_load)；
+      - **卤素节点**：h = max(0, 1 − bond_load)，并计入对应卤素计数。
+
+    旧口径（不含 N 的图）与本函数**逐位一致** → `graph_formula_parts` 是其薄包装。
+    """
+    n_c = n_n = n_o = 0
     total_h = 0
     total_f = total_cl = total_br = total_i = 0
+    halo_counts = [0, 0, 0, 0]
 
     for node in G.nodes():
         label = G.nodes[node].get('label', 'C')
+        nd = G.nodes[node]
+        # 允许键数：元素基准价 + 形式电荷修正（+ valence_override 优先）
+        av = atom_valence(label, nd)
         bond_load = sum(
             3 if G[node][nb].get('bond_type') == 'triple' else
             2 if G[node][nb].get('bond_type') == 'double' else 1
             for nb in G.neighbors(node)
         )
-        oh, co = G.nodes[node].get('oxo_counts', (0, 0))
-        hc = G.nodes[node].get('halogen_counts', (0, 0, 0, 0))
+
+        # ── N 节点：同样要统计其取代基（N-卤代 / N-氧代）──
+        #   历史缺陷：此处曾直接 `continue`（只算 H），导致 **N 上的 halogen_counts
+        #   被完全忽略** → N-氯代物的分子式被算成"无卤素"→ 门禁误剔除。
+        #   无取代基属性时（纯 C/H/N、N+O 断言机产出）行为与旧实现逐位一致。
+        if label == 'N':
+            n_n += 1
+            oh, co = nd.get('oxo_counts', (0, 0))
+            hc = nd.get('halogen_counts', (0, 0, 0, 0))
+            halo_on_node = sum(hc)
+            n_o += oh + co
+            for _i in range(4):
+                halo_counts[_i] += hc[_i]
+            total_h += max(0, av - bond_load - oh - 2 * co - halo_on_node)
+            total_h += oh
+            continue
+
+        # ── 显式卤素节点（展开图）：1 价 ──
+        if label in _HALOGEN_INDEX:
+            halo_counts[_HALOGEN_INDEX[label]] += 1
+            total_h += max(0, av - bond_load)
+            continue
+
+        oh, co = nd.get('oxo_counts', (0, 0))
+        hc = nd.get('halogen_counts', (0, 0, 0, 0))
         halo_on_node = sum(hc)
 
         n_o += oh + co
-        total_f += hc[0]
-        total_cl += hc[1]
-        total_br += hc[2]
-        total_i += hc[3]
+        for _i in range(4):
+            halo_counts[_i] += hc[_i]
 
         if label == 'C':
             n_c += 1
         elif label == 'O':
             n_o += 1
 
-        max_v = 4 if label == 'C' else 2
-        h_on_atom = max(0, max_v - bond_load - oh - 2 * co - halo_on_node)
+        h_on_atom = max(0, av - bond_load - oh - 2 * co - halo_on_node)
         total_h += h_on_atom
         total_h += oh  # OH 上的 H
 
-    return (n_c, total_h, n_o, (total_f, total_cl, total_br, total_i))
+    total_f, total_cl, total_br, total_i = halo_counts
+    return (n_c, total_h, n_n, n_o, (total_f, total_cl, total_br, total_i))
+
+
+def graph_formula_parts(G):
+    """从图中统计真实分子式组成 **(nC, nH, nO, (f, cl, br, i))**
+
+    既有 4 元组签名的**薄包装**（丢弃 nN 位）——保持 6 处既有调用方零改动
+    （红线 §8.4-1「门禁不可削弱」的落地方式）。需要氮数时用
+    `graph_formula_parts_full`。
+    """
+    n_c, total_h, _n_n, n_o, halo = graph_formula_parts_full(G)
+    return (n_c, total_h, n_o, halo)
 
 
 def format_graph_formula(G) -> str:
     """从图生成标准分子式字符串（与各 compute_graph_formula 口径一致）
 
-    格式: C{n}H{h}[O{o}][Br..][Cl..][F..][I..]（卤素按字母序）
+    格式: C{n}H{h}[N{n}][O{o}][Br..][Cl..][F..][I..]（卤素按字母序）
+    N=0 时输出与旧实现逐字一致（新增分支不触发）。
     """
-    n_c, total_h, total_o, (f, cl, br, i) = graph_formula_parts(G)
+    n_c, total_h, n_n, total_o, (f, cl, br, i) = graph_formula_parts_full(G)
     base = f"CH{total_h}" if n_c <= 1 else f"C{n_c}H{total_h}"
+    if n_n > 0:
+        base += f"N{n_n}" if n_n > 1 else "N"
     if total_o > 0:
         base += f"O{total_o}" if total_o > 1 else "O"
     for elem, cnt in [('Br', br), ('Cl', cl), ('F', f), ('I', i)]:
@@ -874,23 +1058,26 @@ def format_graph_formula(G) -> str:
 
 def expected_formula_parts(n_carbon, n_hydrogen, n_oxygen,
                            halogen_spec=(0, 0, 0, 0),
-                           n_deuterium=0):
-    """用户输入对应的期望分子式组成 (nC, nH, nO, (f, cl, br, i))
+                           n_deuterium=0, n_nitrogen=0):
+    """用户输入对应的期望分子式组成 (nC, nH, nN, nO, (f, cl, br, i))
 
     参数即 utils.parse_compound_formula 的解析结果（卤素视为 H 替代；
     氘代 D 仅参与合法性校验，不进入图比较——生成器产出的是非氘代母体）。
+
+    `n_nitrogen` 是**末位关键字参数**，默认 0 → 既有调用方逐位不变。
     """
-    return (n_carbon, n_hydrogen, n_oxygen, tuple(halogen_spec))
+    return (n_carbon, n_hydrogen, n_nitrogen, n_oxygen, tuple(halogen_spec))
 
 
 def formula_matches_input(G, n_carbon, n_hydrogen, n_oxygen,
-                          halogen_spec=(0, 0, 0, 0), n_deuterium=0):
+                          halogen_spec=(0, 0, 0, 0), n_deuterium=0,
+                          n_nitrogen=0):
     """分子式门禁：图 G 的真实分子式是否与用户输入完全一致
 
     任何生成路径（=O 使 k+1、原子矩阵补漏枚举全部不饱和度、片段合并
-    改变 k 等）只要产出分子式不符的结构，该函数即返回 False。
+    改变 k、含氮预言机枚举等）只要产出分子式不符的结构，该函数即返回 False。
     """
     if n_deuterium < 0 or n_deuterium > n_hydrogen:
         return False
-    return graph_formula_parts(G) == expected_formula_parts(
-        n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium)
+    return graph_formula_parts_full(G) == expected_formula_parts(
+        n_carbon, n_hydrogen, n_oxygen, halogen_spec, n_deuterium, n_nitrogen)

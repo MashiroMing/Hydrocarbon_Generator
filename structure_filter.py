@@ -275,12 +275,13 @@ def filter_by_expected_formula(
     halogen_spec=(0, 0, 0, 0),
     n_deuterium: int = 0,
     to_graph_fn=None,
+    n_nitrogen: int = 0,
 ) -> list:
     """统一分子式门禁：仅保留真实分子式 == 用户输入分子式的异构体。
 
-    该函数是纯烃 / 含氧 / 卤代三条生成路径的统一兜底过滤，
+    该函数是纯烃 / 含氧 / 卤代 / **含氮** 四条生成路径的统一兜底过滤，
     防止任何生成路径产出分子式不符的结构（如 =O 使 k+1、原子矩阵
-    补漏枚举全部不饱和度、片段合并改变 k 等）。
+    补漏枚举全部不饱和度、片段合并改变 k、含氮预言机超价等）。
 
     Args:
         all_isomers: [(mol_type, data), ...]；data 为 nx.Graph 或规范字符串。
@@ -288,6 +289,7 @@ def filter_by_expected_formula(
             用户输入解析结果（utils.parse_compound_formula 口径）。
         to_graph_fn: 可选回调 to_graph_fn(mol_type, data) -> nx.Graph | None，
                      用于将规范字符串转图（图条目跳过转换）。
+        n_nitrogen: 氮原子数（**末位关键字参数**，默认 0 → 三条既有路径行为不变）。
 
     Returns:
         过滤后的 [(mol_type, data), ...]，顺序与原列表一致。
@@ -304,6 +306,6 @@ def filter_by_expected_formula(
             if G is None:
                 continue
         if formula_matches_input(G, n_carbon, n_hydrogen, n_oxygen,
-                                 halogen_spec, n_deuterium):
+                                 halogen_spec, n_deuterium, n_nitrogen):
             result.append((mol_type, data))
     return result

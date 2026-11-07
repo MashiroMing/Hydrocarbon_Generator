@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import networkx as nx
 
 from utils import (parse_compound_formula, formula_matches_input,
-                   format_graph_formula)
+                   format_graph_formula, graph_formula_parts_full)
 from structure_filter import filter_by_expected_formula, StructureConstraint
 from oxygen.unified_oxo_generator import UnifiedOxoGenerator
 
@@ -61,7 +61,7 @@ def gen_buckets(formula, constraint=None, use_parallel=False):
     "并行/串行等价" 用例覆盖（见 main() 完整档）。
     """
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, err = res
+    _, nc, nh, no, halo, _, err, _n_n = res
     assert not err, f"parse error: {err}"
     h_equiv = nh + sum(halo)
     k = (2 * nc + 2 - h_equiv) // 2 if h_equiv else 3
@@ -73,7 +73,7 @@ def gen_buckets(formula, constraint=None, use_parallel=False):
 
 def expected_formula_str(formula):
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, _, _ = res
+    _, nc, nh, no, halo, _, _, _n_n = res
     s = f"CH{nh}" if nc == 1 else f"C{nc}H{nh}"
     if no:
         s += f"O{no}" if no > 1 else "O"
@@ -199,13 +199,57 @@ def test_negative_cases():
           not formula_matches_input(chlorobenzene, 6, 6, 0, (0, 0, 0, 0)))
 
 
+def test_n_plus_halogen():
+    """N + 卤素 / N + O + 卤素：解析放行 + **N-卤代**门禁正确
+
+    历史缺陷（开发过程.md §16.3）：`graph_formula_parts_full` 的 N 分支曾直接
+    `continue`，忽略 N 节点上的 `halogen_counts` → N-氯代物（如 CH3-NH-Cl）
+    被算成"无卤素"，被分子式门禁误剔除（实测 C2H4ClNO 少 15 个、C2H3Cl2NO 少 38 个，
+    与 MAYGEN 对拍确认全部缺失都是 N-卤代物）。
+    """
+    print("\n== N + 卤素（解析放行 + N-卤代门禁） ==")
+    import networkx as nx
+
+    # 解析层：{N, O, 卤素} 8 种组合全部放行
+    for fml in ('C2H6', 'C2H6O', 'C2H5Cl', 'C2H5ClO',
+                'C2H7N', 'C2H5NO', 'C2H6ClN', 'C2H4ClNO'):
+        _r = parse_compound_formula(fml)
+        check(f"{fml}: 解析放行（无互斥）", _r[6] is None, str(_r[6]))
+
+    # N-氯代甲胺 CH3-NH-Cl（N 上带 halogen_counts）→ 应为 CH4ClN
+    G = nx.Graph()
+    G.add_node(0, label='C')
+    G.add_node(1, label='N')
+    G.add_edge(0, 1, bond_type='single')
+    G.nodes[1]['halogen_counts'] = (0, 1, 0, 0)
+    check("N-氯代甲胺: 图公式 == CH4NCl（项目约定序 C→H→N→O→卤）",
+          format_graph_formula(G) == 'CH4NCl', format_graph_formula(G))
+    check("N-氯代甲胺: parts 含 1 个 Cl",
+          graph_formula_parts_full(G)[4][1] == 1,
+          str(graph_formula_parts_full(G)))
+    check("N-氯代甲胺: 门禁对 CH4ClN 返回 True",
+          formula_matches_input(G, 1, 4, 0, (0, 1, 0, 0), 0, n_nitrogen=1))
+    check("N-氯代甲胺: 门禁对 CH5N（无卤）返回 False",
+          not formula_matches_input(G, 1, 5, 0, (0, 0, 0, 0), 0, n_nitrogen=1))
+    # N 上的 OH 也应计入（N-羟基：CH3-NH-OH = CH5NO，甲羟基胺）
+    G2 = nx.Graph()
+    G2.add_node(0, label='C')
+    G2.add_node(1, label='N')
+    G2.add_edge(0, 1, bond_type='single')
+    G2.nodes[1]['oxo_counts'] = (1, 0)
+    check("N-羟基（甲羟基胺）: 图公式 == CH5NO",
+          format_graph_formula(G2) == 'CH5NO', format_graph_formula(G2))
+    check("N-羟基: 门禁对 CH5NO 返回 True",
+          formula_matches_input(G2, 1, 5, 1, (0, 0, 0, 0), 0, n_nitrogen=1))
+
+
 def test_gui_gate_simulation(formula, results=None):
     print(f"\n== GUI 后端流程模拟: {formula} ==")
     buckets = gen_buckets(formula)
     all_isomers = [(mt, G) for items in buckets.values()
                    for mt, G in items]
     res = parse_compound_formula(formula)
-    _, nc, nh, no, halo, nd, _ = res
+    _, nc, nh, no, halo, nd, _, _n_n = res
     before = len(all_isomers)
     filtered = filter_by_expected_formula(all_isomers, nc, nh, no, halo, nd)
     expect = expected_formula_str(formula)
@@ -385,6 +429,7 @@ def main():
 
     # 2) 负例单元断言 + 纯烃修复（秒级）
     test_negative_cases()
+    test_n_plus_halogen()
     test_pure_hydrocarbon_fix()
 
     if not smoke:

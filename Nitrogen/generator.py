@@ -260,8 +260,8 @@ class NitrogenGenerator:
             """
             if not is_valence_legal(g):
                 return False
-            n_c, n_h, n_n = graph_formula_parts(g)
-            if n_c != n_carbon or n_n != n_nitrogen or n_h not in target_h_set:
+            n_c, n_h, n_n, n_o = graph_formula_parts(g)
+            if n_c != n_carbon or n_n != n_nitrogen or n_o != 0 or n_h not in target_h_set:
                 return False
             fml = format_graph_formula(g)
             wl = nx.weisfeiler_lehman_graph_hash(
