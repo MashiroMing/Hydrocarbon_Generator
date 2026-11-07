@@ -1,6 +1,8 @@
 # Hydrocarbon_Generator — 有机分子异构体生成与可视化工具
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22732958.svg)](https://doi.org/10.5281/zenodo.22732958)
+[![Release](https://img.shields.io/github/v/release/MashiroMing/Hydrocarbon_Generator?color=blue)](https://github.com/MashiroMing/Hydrocarbon_Generator/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 基于 **Python + Tkinter** 的有机分子同分异构体生成与可视化软件：输入分子式，即可自动枚举全部异构体，并进行 **2D 键线式渲染**、**3D 交互可视化** 与 **Gaussian 输入文件导出**。
 
@@ -14,6 +16,7 @@
 
 - **异构体自动枚举**：输入分子式，按不饱和度自动判定类型并分派生成器，枚举全部同分异构体
 - **含氮化合物完备枚举**：C/H/N/O（可再含卤素）走**原子矩阵预言机**（穷举真值），支持 2D / 3D / `.gjf` 全链路
+- **含磷化合物（第一期）**：C/H/P 走矩阵预言机完备枚举，支持 2D / 3D / `.gjf`；与 MAYGEN 1.8 的 53 个分子式逐式对拍一致（P 与 O/N/卤素暂互斥）
 - **基团构建模式（快速）**：勾选硝基 / 氨基 / 羟基 / 氰基 / 羧基 / 卤素等基团，直接"碳骨架 + 基团挂载"，**秒级**出结果（如 `C6H5NO2` + 硝基 → 硝基苯）；该模式为**非完备**补充通道，界面会明确标注
 - **严格去重**：Weisfeiler-Lehman 图哈希 + 精确同构校验（矩阵级内核），确保不重复、不遗漏
 - **分子式一致性门禁**：全管线末端统一校验，输出分子式与用户输入严格一致
@@ -48,7 +51,8 @@
 > **特殊基团**：硝基（–NO₂）、叠氮（–N₃）等超出中性八隅律口径的基团以**电荷分离式**表示，
 > 只能通过"基团构建模式 / 代码 API"按需使用（`special_groups.attach_group`），**不参与完整枚举**。
 
-> **验证状态说明**：目前仅 **烃类** 物质完成了 **GaussView** 模型验证；**含氧、卤代、含氮等衍生物尚未开展实验/建模验证**，其结果仅供参考。
+> **验证状态说明**：目前仅 **烃类** 物质完成了 **GaussView** 模型验证；**含氧、卤代、含氮、含磷等衍生物尚未开展实验/建模验证**，其结果仅供参考。
+> 生成计数已与 MAYGEN 逐式对拍（N: 15 式、P: 53 式，含氮含氧 15 式基线），详见 `Instruction Data/开发过程.md` §十五、§二十。
 
 ## 分子式输入格式
 
@@ -150,6 +154,10 @@ python tools/boundary_report.py C7H6O2 --max-atoms 10
 
 ## 安装与运行
 
+**方式一：下载打包版（推荐给非开发者）** —— 见 [已打包仓库](https://github.com/MashiroMing/Hydrocarbon_Generator_Package) 或 [Releases](https://github.com/MashiroMing/Hydrocarbon_Generator/releases)。
+
+**方式二：源码运行**
+
 ```bash
 git clone https://github.com/MashiroMing/Hydrocarbon_Generator.git
 cd Hydrocarbon_Generator
@@ -179,6 +187,40 @@ pyinstaller Hydrocarbon_Generator_linux.spec   # Linux
 产物位于 `dist/Hydrocarbon_Generator/`。如需自定义，可修改 `.spec` 中的 `name`（程序名）、`icon`（图标）、`console`（是否显示控制台）、`datas` / `hiddenimports` / `excludes` 等字段。
 
 > **注意**：请勿将 `tkinter` 加入 `excludes`，否则 GUI 无法运行。Linux 下若中文显示为方框，请安装中文字体：`sudo apt install -y fonts-wqy-zenhei fonts-noto-cjk`。
+
+## 更新日志
+
+### v1.2.0（2026-11-07）
+
+**新增**
+- **含氮化合物完备枚举**：C/H/N/O（可再含卤素）走原子矩阵预言机，2D 键线式 / 3D / `.gjf` 全链路
+- **含磷化合物（第一期）**：新增 `Phosphorus/` 模块（C/H/P，P=3 价），CLI 与 GUI 均可用；
+  与 MAYGEN 1.8 的 53 个分子式逐式对拍一致
+- **特殊基团构建模式**：硝基 / 亚硝基 / 叠氮 / 氨基 / 羟基 / 氰基 / 羧基 / 卤素等，
+  勾选即「碳骨架 + 基团挂载」，秒级出结果（非完备通道，界面明确标注）
+- **常用基团面板**：11 个基团常驻可见，可折叠，选择状态随布局记忆
+
+**变更（UI）**
+- 左右（列表｜分子信息）与右侧上下（键线式｜信息文本）改为**可拖拽分栏**
+- 键线式按画布实际尺寸渲染并随缩放**节流重绘**；双击分隔条恢复默认比例
+- 布局记忆：窗口尺寸 + 分隔条位置（`~/.hydrocarbon_generator/ui_layout.json`）
+- 默认窗口 1100×760、最小 900×660
+
+**性能**
+- 去重内核下沉到矩阵级（WL + 精确同构）：C5H7N **6.3×**、C6H5N **5.9×**（集合逐元素一致）
+- 预言机前缀并行（12 核）+ 结果磁盘缓存（重复分子式秒回）+ 生成前 ETA + 实时计数
+
+**修复**
+- 含氧/卤代 `.gjf` 导出静默丢杂原子、氢数错误（`C6H6O` 曾被导出成 `C6H8`）
+- N-卤代结构被分子式门禁误剔除
+- 含氮生成时基团模式误走完整枚举预检（多弹窗 + 白等 2.5s）
+- 流式回调跨线程操作 Tk（状态栏异常 / 偶发 `main thread is not in main loop`）
+- UI 非最大化时分子信息区被挤压至不可见
+
+### v1.1.0 及更早
+
+见 [Releases](https://github.com/MashiroMing/Hydrocarbon_Generator/releases) 与
+`Instruction Data/开发过程.md`。
 
 ## 引用
 
